@@ -1,0 +1,28 @@
+[package]
+name = "flamereader"
+version = "0.1.0"
+edition = "2021"
+description = "High performance SVG flame graph viewer for Windows (native, GPU accelerated)"
+rust-version = "1.75"
+
+[features]
+default = []
+# Hides the console window on Windows release builds:
+#   cargo build --release --features gui
+gui = []
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+flate2 = "1.1.10"
+memchr = "2.8.3"
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+rfd = "0.17.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
