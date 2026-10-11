@@ -6,7 +6,9 @@ description = "High performance SVG flame graph viewer for Windows (native, GPU 
 
 [features]
 default = []
-# Hides the console window on Windows release builds:
+# A GUI launch already detaches the console at runtime, which costs one brief
+# flash of the console window. Link as a windows subsystem binary instead to
+# remove even that, at the price of the CLI modes printing nothing:
 #   cargo build --release --features gui
 gui = []
 

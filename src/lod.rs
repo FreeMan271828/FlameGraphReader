@@ -34,6 +34,35 @@ pub const LABEL_BUDGET: usize = 400;
 /// legible even for extremely wide graphs.
 pub const MIN_FIT_ROW_PX: f32 = 3.0;
 
+/// Row separation, in screen pixels. Rows thinner than the first constant are
+/// left alone (insetting them would erase them); thicker ones give up at most a
+/// pixel on each side.
+const BAND_GAP_MIN_BAND: f32 = 4.0;
+const BAND_GAP_RATIO: f32 = 0.15;
+const BAND_GAP_MIN: f32 = 0.6;
+const BAND_GAP_MAX: f32 = 1.0;
+
+/// Column separation, in screen pixels per side. Generators tile a row exactly,
+/// and it is the rounded corners (rx="2") in the original document that separate
+/// one frame from the next. The viewer draws square rectangles because that is
+/// what keeps the vertex count bounded, so without a seam two adjacent frames of
+/// the same colour merge into one uninterrupted bar.
+const COLUMN_SEAM_MIN_W: f32 = 3.0;
+const COLUMN_SEAM_RATIO: f32 = 0.05;
+const COLUMN_SEAM_MIN: f32 = 0.3;
+const COLUMN_SEAM_MAX: f32 = 0.5;
+
+/// Screen-space inset applied to each side of a frame, so neighbouring frames in
+/// a row stay visually separate at every zoom level.
+#[inline]
+pub fn column_inset(screen_w: f32) -> f32 {
+    if screen_w > COLUMN_SEAM_MIN_W {
+        (screen_w * COLUMN_SEAM_RATIO).clamp(COLUMN_SEAM_MIN, COLUMN_SEAM_MAX)
+    } else {
+        0.0
+    }
+}
+
 /// A rectangular region of the graph: everything outside it is not drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bounds {
@@ -173,6 +202,23 @@ impl Viewport {
             -v
         } else {
             v
+        }
+    }
+
+    /// Screen-space inset to apply to a row band so neighbouring rows stay
+    /// visually separate.
+    ///
+    /// Documents that use the row pitch as the frame height tile their rows
+    /// exactly, and even a genuine one-unit gap can be far below a pixel when
+    /// zoomed out. Without an enforced separation the anti-aliased edges of
+    /// adjacent rows blend into each other and the whole graph smears.
+    #[inline]
+    pub fn band_inset(&self, graph_h: f32) -> f32 {
+        let band = (graph_h as f64 * self.scale).abs() as f32;
+        if band > BAND_GAP_MIN_BAND {
+            (band * BAND_GAP_RATIO).clamp(BAND_GAP_MIN, BAND_GAP_MAX)
+        } else {
+            0.0
         }
     }
 
@@ -520,8 +566,14 @@ fn emit_levels(
     stats.row_step = stats.row_step.max(step as u32);
 
     let drawn_rows = levels.len().div_ceil(step).max(1);
+    // Merged stretches can add up to one segment per few pixels on top of the
+    // individually drawn frames, so reserve room for them before deciding how
+    // much of the budget the drawn frames may use.
+    let merged_reserve = (view.w / MERGED_SEGMENT_PX).ceil() as usize + 1;
     // Guard against a pathological zoom-out where every row is sub-pixel.
-    let per_row = (limit.saturating_sub(quads.len()) / drawn_rows).max(MIN_PER_ROW);
+    let per_row = (limit.saturating_sub(quads.len()) / drawn_rows)
+        .saturating_sub(merged_reserve)
+        .max(MIN_PER_ROW);
     let label_cap = (LABEL_BUDGET / drawn_rows).max(4);
 
     let mut li = levels.start;
@@ -529,12 +581,20 @@ fn emit_levels(
         let level = &scene.levels[li];
         let sy0 = vp.sy(level.y);
         let sy1 = vp.sy(level.y + level.h);
-        let (top, bottom) = if sy0 <= sy1 { (sy0, sy1) } else { (sy1, sy0) };
+        let (mut top, mut bottom) = if sy0 <= sy1 { (sy0, sy1) } else { (sy1, sy0) };
         if bottom < view.y - 1.0 || top > view.y + view.h + 1.0 {
             li += step;
             continue;
         }
         stats.rows_drawn += 1;
+
+        // Give every row a visible gap, so a zoomed-out graph reads as rows
+        // rather than one smeared block.
+        let inset = vp.band_inset(level.h);
+        if inset > 0.0 && bottom - top > 2.0 * inset + 1.0 {
+            top += inset;
+            bottom -= inset;
+        }
 
         let range = scene.frames_in_level(li, gx0, gx1);
         let count = range.len();
@@ -581,7 +641,7 @@ fn emit_row(
     stats: &mut Stats,
 ) {
     let frames = &scene.frames;
-    let mut run: Option<(f32, f32, u32, f32)> = None;
+    let mut run: Option<Run> = None;
     let mut row_labels = 0usize;
 
     for idx in range {
@@ -595,38 +655,49 @@ fn emit_row(
         };
 
         if wpx < rb.min_px {
+            // A merge must not erase the structure of a dense row. Dropping a
+            // whole stretch into one quad - coloured by whichever frame happened
+            // to be widest - turned hundreds of frames into what looked like a
+            // single flat node, and zooming in only "fixed" it because the frames
+            // stopped needing to be merged. So a colour change starts a new
+            // segment, but only once the current one is a few pixels wide, which
+            // caps the extra quads at roughly one per few pixels.
+            let start_new = run
+                .as_ref()
+                .is_some_and(|r| r.first_color != color && r.x1 - r.x0 >= MERGED_SEGMENT_PX);
+            if start_new {
+                flush_run(&mut run, sy0, sy1, limit, quads, stats);
+            }
             match &mut run {
                 Some(r) => {
-                    r.1 = sx1;
-                    if wpx > r.3 {
-                        r.2 = color;
-                        r.3 = wpx;
+                    r.x1 = sx1;
+                    if wpx > r.widest {
+                        r.color = color;
+                        r.widest = wpx;
                     }
-                    stats.frames_merged += 1;
                 }
-                None => run = Some((sx0, sx1, color, wpx)),
+                None => {
+                    run = Some(Run {
+                        x0: sx0,
+                        x1: sx1,
+                        first_color: color,
+                        color,
+                        widest: wpx,
+                    });
+                }
             }
+            stats.frames_merged += 1;
             continue;
         }
 
-        if let Some(r) = run.take() {
-            if quads.len() < limit {
-                quads.push(Quad {
-                    x0: r.0,
-                    y0: sy0,
-                    x1: r.1,
-                    y1: sy1,
-                    color: r.2,
-                });
-            } else {
-                stats.dropped += 1;
-            }
-        }
+        let (qx0, qx1) = seam(sx0, sx1);
+
+        flush_run(&mut run, sy0, sy1, limit, quads, stats);
         if quads.len() < limit {
             quads.push(Quad {
-                x0: sx0,
+                x0: qx0,
                 y0: sy0,
-                x1: sx1,
+                x1: qx1,
                 y1: sy1,
                 color,
             });
@@ -649,18 +720,58 @@ fn emit_row(
         }
     }
 
+    flush_run(&mut run, sy0, sy1, limit, quads, stats);
+}
+
+/// A stretch of frames too narrow to draw individually.
+///
+/// The first field is what the segment started as, the second what it currently
+/// shows, and the last the widest frame seen so far.
+struct Run {
+    x0: f32,
+    x1: f32,
+    first_color: u32,
+    color: u32,
+    widest: f32,
+}
+
+/// A merged segment is allowed to grow this wide before a colour change starts a
+/// new one.
+const MERGED_SEGMENT_PX: f32 = 3.0;
+
+#[inline]
+fn flush_run(
+    run: &mut Option<Run>,
+    sy0: f32,
+    sy1: f32,
+    limit: usize,
+    quads: &mut Vec<Quad>,
+    stats: &mut Stats,
+) {
     if let Some(r) = run.take() {
+        let (x0, x1) = seam(r.x0, r.x1);
         if quads.len() < limit {
             quads.push(Quad {
-                x0: r.0,
+                x0,
                 y0: sy0,
-                x1: r.1,
+                x1,
                 y1: sy1,
-                color: r.2,
+                color: r.color,
             });
         } else {
             stats.dropped += 1;
         }
+    }
+}
+
+/// Shrink a horizontal span by the column seam, leaving the centre put.
+#[inline]
+fn seam(x0: f32, x1: f32) -> (f32, f32) {
+    let inset = column_inset(x1 - x0);
+    if inset > 0.0 && x1 - x0 > 2.0 * inset + 0.5 {
+        (x0 + inset, x1 - inset)
+    } else {
+        (x0, x1)
     }
 }
 
@@ -743,6 +854,111 @@ mod tests {
             0.0,
             [0.0, 0.0],
         )
+    }
+
+    #[test]
+    fn a_merged_run_keeps_its_colour_structure() {
+        // 4000 sub-pixel frames in one row, alternating colours. Collapsing them
+        // into a single quad made a dense row look like one flat node.
+        let mut v = Vec::with_capacity(4000);
+        for i in 0..4000 {
+            v.push(Frame {
+                x: i as f64 * 0.25,
+                w: 0.25,
+                y: 0.0,
+                h: 15.0,
+                color: if i % 2 == 0 { 0x00_ff_00 } else { 0xff_00_00 },
+                name: 0,
+            });
+        }
+        let scene = Scene::build(
+            v,
+            vec!["fn".into()],
+            "t".into(),
+            "mem".into(),
+            0,
+            0.0,
+            [0.0, 0.0],
+        );
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let g = geom(&scene, &vp, view, None);
+
+        assert!(g.stats.frames_merged > 0, "the fixture should need merging");
+        assert!(
+            g.quads.len() > 1,
+            "a merged run collapsed into {} flat bar(s)",
+            g.quads.len()
+        );
+        // The split is bounded: roughly one quad per few pixels, not one per
+        // frame.
+        assert!(
+            g.quads.len() < 600,
+            "the split emitted {} quads",
+            g.quads.len()
+        );
+        assert_eq!(g.stats.dropped, 0, "the split blew the quad budget");
+    }
+
+    #[test]
+    fn adjacent_frames_in_a_row_keep_a_seam() {
+        // The fixture tiles each row exactly: consecutive frames share an edge,
+        // and same-coloured neighbours used to merge into one unbroken bar.
+        let scene = synthetic(200, 20);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let g = geom(&scene, &vp, view, None);
+
+        let first_row_y = g.quads.first().map(|q| q.y0).expect("geometry");
+        let mut row: Vec<(f32, f32)> = g
+            .quads
+            .iter()
+            .filter(|q| (q.y0 - first_row_y).abs() < 0.01)
+            .map(|q| (q.x0, q.x1))
+            .collect();
+        row.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(
+            row.len() >= 3,
+            "expected a populated row, got {}",
+            row.len()
+        );
+        for w in row.windows(2) {
+            assert!(
+                w[1].0 > w[0].1,
+                "frames {:?} and {:?} touch: they merge into one bar",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_rows_keep_a_visible_gap() {
+        // The fixture tiles its rows exactly (frame height == row pitch), which
+        // is what generators that write height == pitch produce. Zoomed out,
+        // those rows used to blend into a single smeared block.
+        let scene = synthetic(200, 20);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let g = geom(&scene, &vp, view, None);
+
+        let mut bands: Vec<(f32, f32)> = g.quads.iter().map(|q| (q.y0, q.y1)).collect();
+        bands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        bands.dedup_by(|a, b| (a.0 - b.0).abs() < 0.01);
+        assert!(
+            bands.len() >= 3,
+            "expected several rows, got {}",
+            bands.len()
+        );
+        for w in bands.windows(2) {
+            let gap = w[1].0 - w[0].1;
+            assert!(
+                gap > 0.0,
+                "rows {:?} and {:?} touch: the graph will smear",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]

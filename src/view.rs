@@ -47,9 +47,24 @@ fn frame_rect(vp: &Viewport, scene: &Scene, frame: u32) -> Rect {
     let f = scene.frames[frame as usize];
     let x0 = vp.sx(f.x);
     let x1 = vp.sx(f.x + f.w);
-    let y0 = vp.sy(f.y);
-    let y1 = vp.sy(f.y + f.h);
-    Rect::from_min_max(pos(x0.min(x1), y0.min(y1)), pos(x0.max(x1), y0.max(y1)))
+    let (mut y0, mut y1) = (vp.sy(f.y), vp.sy(f.y + f.h));
+    if y1 < y0 {
+        std::mem::swap(&mut y0, &mut y1);
+    }
+    // Match the inset the geometry applies, so outlines and label clips line up
+    // with the row that is actually drawn.
+    let inset = vp.band_inset(f.h);
+    if inset > 0.0 && y1 - y0 > 2.0 * inset + 1.0 {
+        y0 += inset;
+        y1 -= inset;
+    }
+    let (mut xa, mut xb) = (x0.min(x1), x0.max(x1));
+    let cin = lod::column_inset(xb - xa);
+    if cin > 0.0 && xb - xa > 2.0 * cin + 0.5 {
+        xa += cin;
+        xb -= cin;
+    }
+    Rect::from_min_max(pos(xa, y0), pos(xb, y1))
 }
 
 /// What the user did inside the graph this frame.

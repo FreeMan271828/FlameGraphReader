@@ -3,11 +3,15 @@
 //!
 //! Run with no arguments for the GUI, or use one of the CLI modes:
 //!
-//!     flamereader big.svg            open a file in the GUI
+//!     flamereader big.svg            open a file in the GUI (no console window)
 //!     flamereader --gen out.svg N    write a synthetic N frame flame graph
 //!     flamereader --selftest f.svg   parse and verify, print statistics
 //!     flamereader --bench f.svg      measure culling and mesh build cost
 //!     flamereader --smoke f.svg N    render N frames headfully and report fps
+//!
+//! The binary is linked as a console application so the CLI modes can print. A
+//! GUI launch detaches that console again (see detach_console_for_gui), unless it
+//! was inherited from a terminal.
 
 #![cfg_attr(
     all(windows, not(debug_assertions), feature = "gui"),
@@ -57,8 +61,49 @@ enum Mode {
     },
 }
 
+/// Detach the console Windows allocates for a console subsystem binary.
+///
+/// The binary stays a console application so that the CLI modes can print, but
+/// launching it as a GUI would otherwise leave a black console window sitting
+/// behind the whole session, which is not what double-clicking a viewer should
+/// look like.
+///
+/// Two conditions keep the console:
+/// * any CLI option is present, because the user asked for console output;
+/// * more than one process is attached, which means the console belongs to a
+///   terminal we were started from and taking it away would close their window.
+#[cfg(windows)]
+fn detach_console_for_gui(args: &[String]) {
+    if args.iter().any(|a| a.starts_with('-')) {
+        return;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+        fn GetConsoleProcessList(process_list: *mut u32, count: u32) -> u32;
+        fn FreeConsole() -> i32;
+    }
+
+    // SAFETY: the three calls only touch this process's console attachment.
+    unsafe {
+        if GetConsoleWindow().is_null() {
+            return;
+        }
+        let mut attached = [0u32; 2];
+        if GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) > 1 {
+            return;
+        }
+        FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_console_for_gui(_args: &[String]) {}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    detach_console_for_gui(&args);
     let mode = match parse_args(&args) {
         Ok(m) => m,
         Err(e) => {
