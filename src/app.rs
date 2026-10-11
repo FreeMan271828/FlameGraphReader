@@ -798,7 +798,7 @@ impl FlameApp {
             return;
         };
         let focus = doc.view.focus;
-        let path = doc.view.focus_path(&scene);
+        let path: Vec<u32> = doc.view.focus_path().to_vec();
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("Path:").color(Color32::from_gray(140)));

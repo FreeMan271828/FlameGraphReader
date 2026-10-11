@@ -103,6 +103,28 @@ impl Focus {
     }
 }
 
+/// Whether a frame is part of the focused view.
+///
+/// After focusing, the only frames on screen are the path from the root down to
+/// the focused frame (faded) and the subtree below it (full strength). Hit
+/// testing has to agree with that exactly, otherwise the empty space around a
+/// focused subtree still lights up frames that were culled away - the sibling
+/// rows above the focus used to be hoverable because "above the focus row" was
+/// mistaken for "on the path".
+pub fn is_focused_visible(scene: &Scene, focus: Option<Focus>, path: &[u32], frame: u32) -> bool {
+    let Some(f) = focus else {
+        return true;
+    };
+    if frame == f.frame || path.contains(&frame) {
+        return true;
+    }
+    let hf = scene.frames[frame as usize];
+    // Inside the subtree: at or below the focus row, overlapping its x-interval.
+    // A subtree occupies exactly that interval on every row, so this is the same
+    // test the bright pass uses.
+    hf.y >= f.y0 && hf.x < f.x1 && hf.x + hf.w > f.x0
+}
+
 /// Pan/zoom transform. Graph x is f64 and graph y is f32; screen space is f32,
 /// because pixels never need more.
 #[derive(Clone, Copy, Debug)]
@@ -721,6 +743,51 @@ mod tests {
             0.0,
             [0.0, 0.0],
         )
+    }
+
+    #[test]
+    fn hit_testing_agrees_with_what_is_drawn() {
+        let scene = uneven_tree();
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 15.0 && f.x == 0.0)
+            .expect("A1 exists") as u32;
+        let focus = Focus::of(&scene, target);
+        let path = scene.ancestry(target);
+
+        // The focused frame and every frame on the path above it are hittable.
+        assert!(is_focused_visible(&scene, Some(focus), &path, target));
+        for a in &path {
+            assert!(
+                is_focused_visible(&scene, Some(focus), &path, *a),
+                "path frame {a} is not hittable"
+            );
+        }
+
+        // A sibling sharing a row with an ancestor was culled away and never
+        // drawn. Hovering the empty space around the subtree must not find it -
+        // this is exactly the bug the predicate exists for.
+        let sibling = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 0.0 && f.x == 500.0)
+            .expect("B exists") as u32;
+        assert!(
+            !is_focused_visible(&scene, Some(focus), &path, sibling),
+            "a culled away sibling is still hittable"
+        );
+
+        // Nor is anything from the branch that keeps going deeper.
+        let elsewhere = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 60.0)
+            .expect("deep row exists") as u32;
+        assert!(!is_focused_visible(&scene, Some(focus), &path, elsewhere));
+
+        // Without a focus every frame is hittable.
+        assert!(is_focused_visible(&scene, None, &[], sibling));
     }
 
     #[test]

@@ -80,6 +80,9 @@ pub struct FlameView {
 
     /// When set, only this frame and its descendants are drawn.
     pub focus: Option<Focus>,
+    /// Cached path from the root down to the focused frame. Kept here so hit
+    /// testing and the breadcrumb bar do not recompute it every frame.
+    focus_path: Vec<u32>,
     /// Clicking a frame drills into its subtree. On by default: it is the
     /// fastest way to answer "what is under this?".
     pub focus_on_click: bool,
@@ -111,6 +114,7 @@ impl Default for FlameView {
             current_hit: 0,
             last_view: ScreenRect::new(0.0, 0.0, 1.0, 1.0),
             focus: None,
+            focus_path: Vec::new(),
             focus_on_click: true,
             root_at_bottom: true,
             geometry: Geometry::default(),
@@ -145,6 +149,7 @@ impl FlameView {
     /// Drill into a frame: draw only it and its descendants.
     pub fn set_focus(&mut self, scene: &Scene, frame: u32) {
         self.focus = Some(Focus::of(scene, frame));
+        self.focus_path = scene.ancestry(frame);
         self.selected = Some(frame);
         self.initialized = false;
     }
@@ -152,16 +157,14 @@ impl FlameView {
     /// Return to the whole graph.
     pub fn clear_focus(&mut self) {
         if self.focus.take().is_some() {
+            self.focus_path.clear();
             self.initialized = false;
         }
     }
 
     /// Path from the root down to the focused frame, for breadcrumbs.
-    pub fn focus_path(&self, scene: &Scene) -> Vec<u32> {
-        match self.focus {
-            Some(f) => scene.ancestry(f.frame),
-            None => Vec::new(),
-        }
+    pub fn focus_path(&self) -> &[u32] {
+        &self.focus_path
     }
 
     pub fn set_palette(&mut self, p: Palette) {
@@ -273,16 +276,11 @@ impl FlameView {
 
         let hovered = hover_pos.and_then(|p| {
             let hit = scene.frame_at(self.vp.gx(p.x), self.vp.gy(p.y) as f32)?;
-            // While a subtree is focused, only that subtree and the faded rows
-            // above it are on screen. Hitting a culled away frame would select
-            // something the user cannot see.
-            if let Some(f) = self.focus {
-                let hf = scene.frames[hit as usize];
-                let above = hf.y < f.y0;
-                let inside_x = hf.x < f.x1 && hf.x + hf.w > f.x0;
-                if !above && !inside_x {
-                    return None;
-                }
+            // The empty space around a focused subtree must be genuinely empty:
+            // only the faded path and the subtree itself are on screen, so only
+            // those may be hovered or clicked.
+            if !lod::is_focused_visible(scene, self.focus, &self.focus_path, hit) {
+                return None;
             }
             Some(hit)
         });
@@ -298,7 +296,11 @@ impl FlameView {
                 } else {
                     action = Action::Selected(h);
                 }
-            } else {
+            } else if self.focus.is_none() {
+                // Clicking empty space clears the selection, but not while a
+                // subtree is focused: the space around it is mostly the culled
+                // away part of the graph, and a stray click should not throw
+                // away what the user is inspecting.
                 self.selected = None;
             }
         }
