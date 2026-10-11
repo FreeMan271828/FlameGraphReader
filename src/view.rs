@@ -8,7 +8,7 @@ use std::time::Instant;
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke};
 
-use crate::lod::{self, Bounds, Focus, LabelReq, Quad, ScreenRect, Stats, Viewport};
+use crate::lod::{self, Bounds, Focus, Geometry, ScreenRect, Stats, Viewport};
 use crate::palette::{self, Palette};
 use crate::scene::Scene;
 
@@ -24,6 +24,21 @@ fn c32(c: u32) -> Color32 {
 #[inline]
 fn pos(x: f32, y: f32) -> Pos2 {
     Pos2::new(x, y)
+}
+
+/// Alpha applied to the path above a focused subtree.
+const FADED_ALPHA: u8 = 52;
+
+#[inline]
+fn faded(c: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), FADED_ALPHA)
+}
+
+/// Label colour for the faded path. Always light, because those rectangles are
+/// blended into the dark panel background.
+#[inline]
+fn faded_label() -> Color32 {
+    Color32::from_rgba_unmultiplied(228, 233, 240, 180)
 }
 
 /// Screen rect of a frame. Normalised, because a flipped viewport maps the
@@ -72,9 +87,9 @@ pub struct FlameView {
     /// Only mirrors documents that are actually rooted at the top.
     pub root_at_bottom: bool,
 
-    quads: Vec<Quad>,
-    labels: Vec<LabelReq>,
-    pub stats: Stats,
+    /// Frames to draw at full strength, plus the faded rows above a focused
+    /// subtree and the labels to lay out over them.
+    pub geometry: Geometry,
     pub build_us: f64,
     pub label_us: f64,
     pub mesh_vertices: usize,
@@ -98,9 +113,7 @@ impl Default for FlameView {
             focus: None,
             focus_on_click: true,
             root_at_bottom: true,
-            quads: Vec::new(),
-            labels: Vec::new(),
-            stats: Stats::default(),
+            geometry: Geometry::default(),
             build_us: 0.0,
             label_us: 0.0,
             mesh_vertices: 0,
@@ -202,18 +215,17 @@ impl FlameView {
             Some(&self.name_colors[..])
         };
         let t0 = Instant::now();
-        let stats = lod::build(
+        lod::build(
             scene,
             &self.vp,
             view,
             self.budget,
             table,
             self.focus,
-            &mut self.quads,
-            &mut self.labels,
+            &mut self.geometry,
         );
         self.build_us = t0.elapsed().as_secs_f64() * 1e6;
-        stats
+        self.geometry.stats
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, scene: &Scene, placeholder: &str) -> Action {
@@ -233,11 +245,6 @@ impl FlameView {
                 Color32::from_gray(140),
             );
             return action;
-        }
-
-        if !self.initialized {
-            self.vp = lod::fit(scene, view, 14.0, self.bounds(scene), self.flip_y(scene));
-            self.initialized = true;
         }
 
         // ---- input -------------------------------------------------------
@@ -264,8 +271,21 @@ impl FlameView {
             }
         }
 
-        let hovered =
-            hover_pos.and_then(|p| scene.frame_at(self.vp.gx(p.x), self.vp.gy(p.y) as f32));
+        let hovered = hover_pos.and_then(|p| {
+            let hit = scene.frame_at(self.vp.gx(p.x), self.vp.gy(p.y) as f32)?;
+            // While a subtree is focused, only that subtree and the faded rows
+            // above it are on screen. Hitting a culled away frame would select
+            // something the user cannot see.
+            if let Some(f) = self.focus {
+                let hf = scene.frames[hit as usize];
+                let above = hf.y < f.y0;
+                let inside_x = hf.x < f.x1 && hf.x + hf.w > f.x0;
+                if !above && !inside_x {
+                    return None;
+                }
+            }
+            Some(hit)
+        });
         self.hovered = hovered;
 
         if resp.clicked() {
@@ -293,13 +313,36 @@ impl FlameView {
             action = Action::FitRequested;
         }
 
+        // A click that changed the focus (or a search jump) invalidates the
+        // viewport. Refit here, after input and before geometry, so the frame
+        // the user is about to see is already correct: egui only repaints on
+        // input, so deferring the refit to the next frame would leave a stale
+        // view on screen until the mouse moved.
+        if !self.initialized {
+            self.vp = lod::fit(scene, view, 14.0, self.bounds(scene), self.flip_y(scene));
+            self.initialized = true;
+        }
+
         // ---- geometry ----------------------------------------------------
         self.build_geometry(scene, view);
 
         let mut mesh = Mesh::default();
-        mesh.vertices.reserve(self.quads.len() * 4);
-        mesh.indices.reserve(self.quads.len() * 6);
-        for q in &self.quads {
+        let total = self.geometry.len();
+        mesh.vertices.reserve(total * 4);
+        mesh.indices.reserve(total * 6);
+        // The rows above a focused subtree go in first and faded, so the call
+        // path stays visible without competing with the subtree. One mesh means
+        // one draw call for both passes.
+        for q in &self.geometry.faded {
+            if q.x1 <= q.x0 || q.y1 <= q.y0 {
+                continue;
+            }
+            mesh.add_colored_rect(
+                Rect::from_min_max(pos(q.x0, q.y0), pos(q.x1, q.y1)),
+                faded(c32(q.color)),
+            );
+        }
+        for q in &self.geometry.quads {
             if q.x1 <= q.x0 || q.y1 <= q.y0 {
                 continue;
             }
@@ -340,14 +383,21 @@ impl FlameView {
         // ---- labels ------------------------------------------------------
         let t_lab = Instant::now();
         if self.show_labels {
-            for l in &self.labels {
+            for l in &self.geometry.labels {
                 let clip = frame_rect(&self.vp, scene, l.frame);
                 let h = clip.height();
                 if h < 9.0 {
                     continue;
                 }
                 let size = (h * 0.68).clamp(7.0, 15.0);
-                let col = c32(palette::label_color(self.frame_color(scene, l.frame)));
+                let col = if l.faded {
+                    // Names on the faded path must stay readable, so they use a
+                    // light colour rather than the contrast colour of a
+                    // rectangle that has been blended into the background.
+                    faded_label()
+                } else {
+                    c32(palette::label_color(self.frame_color(scene, l.frame)))
+                };
                 painter.with_clip_rect(clip).text(
                     pos(l.x, l.center_y),
                     Align2::LEFT_CENTER,

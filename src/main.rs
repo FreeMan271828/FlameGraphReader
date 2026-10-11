@@ -25,7 +25,7 @@ mod search;
 mod svg;
 mod view;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -251,7 +251,7 @@ fn run_gui(files: Vec<PathBuf>, smoke: Option<u32>) -> ExitCode {
     }
 }
 
-fn run_selftest(file: &PathBuf, bench: bool, iters: u32, verbose_chunks: bool) -> ExitCode {
+fn run_selftest(file: &Path, bench: bool, iters: u32, verbose_chunks: bool) -> ExitCode {
     let meta = match std::fs::metadata(file) {
         Ok(m) => m,
         Err(e) => {

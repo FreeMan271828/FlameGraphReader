@@ -3,7 +3,6 @@ name = "flamereader"
 version = "0.1.0"
 edition = "2021"
 description = "High performance SVG flame graph viewer for Windows (native, GPU accelerated)"
-rust-version = "1.75"
 
 [features]
 default = []

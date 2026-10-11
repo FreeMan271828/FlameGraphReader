@@ -358,15 +358,22 @@ impl FlameApp {
             self.show_help = !self.show_help;
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+        // Escape (or Backspace) unwinds one step at a time: first out of the
+        // focused subtree, then off the selection. Clearing everything at once
+        // made it impossible to back out of a deep drill-down gradually.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Backspace))
+        {
             if let Some(doc) = self.docs.get_mut(self.active) {
-                doc.view.selected = None;
-                doc.view.highlight.clear();
-                // Step out of any focused subtree first.
-                doc.view.clear_focus();
+                if doc.view.focus.is_some() {
+                    doc.view.clear_focus();
+                } else {
+                    doc.view.selected = None;
+                    doc.view.highlight.clear();
+                    self.hits.clear();
+                    self.hit_total = 0;
+                }
             }
-            self.hits.clear();
-            self.hit_total = 0;
             return;
         }
         if typing {
@@ -639,8 +646,8 @@ impl FlameApp {
                         ui.separator();
                         ui.label(format!(
                             "visible {} | quads {} | cull {:.2} ms",
-                            fmt_int(doc.view.stats.frames_considered as usize),
-                            fmt_int(doc.view.stats.quads as usize),
+                            fmt_int(doc.view.geometry.stats.frames_considered as usize),
+                            fmt_int(doc.view.geometry.stats.quads as usize),
                             doc.view.build_us / 1000.0
                         ));
                     }
@@ -870,7 +877,7 @@ impl FlameApp {
                     Action::FocusChanged => {
                         if let Some(f) = self.docs[idx].view.focus {
                             self.status = format!(
-                                "showing only the subtree below {}",
+                                "subtree below {} - rows above it stay faded, click one to go back up",
                                 scene.name_of(f.frame)
                             );
                         }
@@ -938,7 +945,11 @@ impl FlameApp {
                 for (k, v) in [
                     ("Wheel", "zoom at the cursor"),
                     ("Drag", "pan"),
-                    ("Double click", "focus the frame under the cursor"),
+                    (
+                        "Click",
+                        "drill into that frame: its subtree is drawn at full strength and the rows above it stay faded",
+                    ),
+                    ("Double click", "zoom the frame under the cursor to the viewport"),
                     ("Right click", "fit the whole graph"),
                     ("Ctrl+O", "open SVG files"),
                     ("Ctrl+W", "close the current tab"),
@@ -948,7 +959,7 @@ impl FlameApp {
                     ("+ / -", "zoom in / out"),
                     ("0 or F", "fit"),
                     ("Arrows", "pan"),
-                    ("Esc", "clear selection and highlights"),
+                    ("Backspace / Esc", "step out of the focused subtree, then clear the selection"),
                 ] {
                     ui.horizontal(|ui| {
                         ui.add_sized([110.0, 18.0], egui::Label::new(RichText::new(k).strong()));
@@ -1023,11 +1034,11 @@ fn report_frame_times(times: &[f32], scene: Option<&Scene>, doc: Option<&Doc>) -
     if let Some(d) = doc {
         s.push_str(&format!(
             "visible frames   : {}\n",
-            fmt_int(d.view.stats.frames_considered as usize)
+            fmt_int(d.view.geometry.stats.frames_considered as usize)
         ));
         s.push_str(&format!(
             "quads emitted    : {}\n",
-            fmt_int(d.view.stats.quads as usize)
+            fmt_int(d.view.geometry.stats.quads as usize)
         ));
         s.push_str(&format!(
             "mesh vertices    : {}\n",

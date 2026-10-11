@@ -86,12 +86,19 @@ impl Focus {
         }
     }
 
+    /// The region a click should frame: the calls below the focused frame *and*
+    /// the whole path from the root down to it.
+    ///
+    /// The vertical extent ends at the subtree's real depth, not at the graph's
+    /// global depth. Reserving rows the subtree never reaches pushed it into a
+    /// corner of an otherwise empty viewport, and starting at the focused row
+    /// meant a click made the context that explains it vanish.
     pub fn bounds(&self, scene: &Scene) -> Bounds {
         Bounds {
             x0: self.x0,
             x1: self.x1,
-            y0: self.y0,
-            y1: scene.max_y,
+            y0: scene.min_y,
+            y1: scene.subtree_max_y(self.frame),
         }
     }
 }
@@ -187,6 +194,9 @@ pub struct LabelReq {
     pub frame: u32,
     pub x: f32,
     pub center_y: f32,
+    /// True for the labels on the faded path above a focused frame: they are
+    /// drawn subdued rather than dropped.
+    pub faded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -259,7 +269,18 @@ pub fn fit(scene: &Scene, view: ScreenRect, margin: f32, bounds: Bounds, flip_y:
 /// Zoom so that a single frame fills the viewport width.
 pub fn focus_frame(scene: &Scene, frame: u32, view: ScreenRect, flip_y: bool) -> Viewport {
     let f = scene.frames[frame as usize];
-    let scale = (((view.w - 40.0).max(16.0) as f64) / f.w.max(1e-9)).clamp(1e-12, 1e12);
+    // Filling the viewport width with a narrow frame would push every call below
+    // it off screen, which defeats the point of zooming to it.
+    let row_h = scene
+        .levels
+        .first()
+        .map(|l| l.h as f64)
+        .unwrap_or(16.0)
+        .max(1e-9);
+    let context_cap = ((view.h as f64) / (MIN_VISIBLE_ROWS * row_h)).max(1e-9);
+    let scale = (((view.w - 40.0).max(16.0) as f64) / f.w.max(1e-9))
+        .clamp(1e-12, 1e12)
+        .min(context_cap);
     let dir = if flip_y { -1.0 } else { 1.0 };
     let y_target = view.y as f64 + view.h as f64 * 0.35;
     Viewport {
@@ -271,13 +292,56 @@ pub fn focus_frame(scene: &Scene, frame: u32, view: ScreenRect, flip_y: bool) ->
     }
 }
 
+/// At least this many rows stay on screen when zooming to a single frame, so
+/// the calls stacked underneath it do not vanish.
+const MIN_VISIBLE_ROWS: f64 = 6.0;
+
+/// Everything the renderer needs for one frame.
+#[derive(Default)]
+pub struct Geometry {
+    /// Full strength frames: the focused subtree, or the whole graph.
+    pub quads: Vec<Quad>,
+    /// The path from the root down to a focused frame, drawn faded. Only the
+    /// frames the subtree actually depends on are kept: drawing every whole row
+    /// above produced a large dark slab that buried the subtree.
+    pub faded: Vec<Quad>,
+    pub labels: Vec<LabelReq>,
+    pub stats: Stats,
+}
+
+impl Geometry {
+    pub fn clear(&mut self) {
+        self.quads.clear();
+        self.faded.clear();
+        self.labels.clear();
+        self.stats = Stats::default();
+    }
+
+    /// Total quads emitted for this frame, across both passes.
+    pub fn len(&self) -> usize {
+        self.quads.len() + self.faded.len()
+    }
+}
+
 struct RowBudget {
     min_px: f32,
     label_cap: usize,
 }
 
-/// Build the quads (and label requests) for one frame of interaction.
-#[allow(clippy::too_many_arguments)]
+/// Build the geometry for one frame of interaction.
+///
+/// With no focus this is a single viewport pass. With a focused subtree there
+/// are two passes:
+///
+/// * the path from the root down to the focused frame, drawn faded, so the user
+///   keeps their bearings without the context competing with the answer. Only
+///   the frames the subtree actually depends on are kept - drawing every whole
+///   row above produced a large dark slab that buried the subtree;
+/// * the focused subtree itself, at full strength, culled to the one contiguous
+///   x-interval the subtree occupies on each row.
+///
+/// The first pass is O(depth), the second is bounded by the viewport rather than
+/// by the size of the graph.
 pub fn build(
     scene: &Scene,
     vp: &Viewport,
@@ -285,15 +349,11 @@ pub fn build(
     budget: usize,
     name_colors: Option<&[u32]>,
     focus: Option<Focus>,
-    quads: &mut Vec<Quad>,
-    labels: &mut Vec<LabelReq>,
-) -> Stats {
-    quads.clear();
-    labels.clear();
-    let mut stats = Stats::default();
-
+    out: &mut Geometry,
+) {
+    out.clear();
     if scene.is_empty() || vp.scale <= 0.0 || !vp.scale.is_finite() {
-        return stats;
+        return;
     }
 
     let mut gx0 = vp.gx(view.x);
@@ -309,26 +369,122 @@ pub fn build(
         (gy_b, gy_a)
     };
 
-    // Focusing a subtree is just a tighter cull window plus a floor on the row
-    // index: a subtree occupies one contiguous x-interval per row, so the two
-    // constraints are exact and cost nothing.
-    if let Some(f) = focus {
-        gx0 = gx0.max(f.x0);
-        gx1 = gx1.min(f.x1);
-        if gx1 <= gx0 {
-            return stats;
-        }
+    let visible = scene.levels_in_range(gy_lo, gy_hi);
+    if visible.is_empty() {
+        return;
     }
 
-    let all_levels = scene.levels_in_range(gy_lo, gy_hi);
-    let levels = match focus {
-        Some(f) => all_levels.start.max(f.level)..all_levels.end,
-        None => all_levels,
+    let (bright_lo, cx0, cx1) = match focus {
+        Some(f) => {
+            emit_ancestors(scene, vp, view, f.frame, name_colors, out);
+            (visible.start.max(f.level), gx0.max(f.x0), gx1.min(f.x1))
+        }
+        None => (visible.start, gx0, gx1),
     };
-    let n_levels = levels.len() as u32;
-    stats.rows_visited = n_levels;
-    if n_levels == 0 {
-        return stats;
+
+    if cx1 > cx0 && bright_lo < visible.end {
+        let bright_budget = budget.saturating_sub(out.faded.len()).max(MIN_PER_ROW * 2);
+        let limit = out.quads.len() + bright_budget;
+        emit_levels(
+            scene,
+            vp,
+            view,
+            bright_lo..visible.end,
+            cx0,
+            cx1,
+            limit,
+            name_colors,
+            &mut out.quads,
+            Some(&mut out.labels),
+            &mut out.stats,
+        );
+    }
+
+    out.stats.quads = out.len() as u32;
+    out.stats.labels = out.labels.len() as u32;
+}
+
+/// Emit the faded path from the root down to (but excluding) the focused frame.
+///
+/// O(depth), not O(rows): a call tree is at most a few dozen frames deep, so the
+/// context costs a handful of quads.
+fn emit_ancestors(
+    scene: &Scene,
+    vp: &Viewport,
+    view: ScreenRect,
+    frame: u32,
+    name_colors: Option<&[u32]>,
+    out: &mut Geometry,
+) {
+    // Keep the labels short enough that a very deep path cannot flood the layout.
+    const MAX_ANCESTOR_LABELS: usize = 40;
+    let mut labels = 0usize;
+
+    for a in scene.ancestry(frame) {
+        if a == frame {
+            // The focused frame itself is drawn at full strength below.
+            continue;
+        }
+        let f = scene.frames[a as usize];
+        let sx0 = vp.sx(f.x);
+        let sx1 = vp.sx(f.x + f.w);
+        let sy0 = vp.sy(f.y);
+        let sy1 = vp.sy(f.y + f.h);
+        let (qx0, qx1) = (sx0.min(sx1), sx0.max(sx1));
+        let (qy0, qy1) = (sy0.min(sy1), sy0.max(sy1));
+        if qx1 < view.x || qx0 > view.x + view.w || qy1 < view.y || qy0 > view.y + view.h {
+            continue;
+        }
+        let color = match name_colors {
+            Some(t) => t.get(f.name as usize).copied().unwrap_or(f.color),
+            None => f.color,
+        };
+        out.faded.push(Quad {
+            x0: qx0,
+            y0: qy0,
+            x1: qx1,
+            y1: qy1,
+            color,
+        });
+        out.stats.frames_considered += 1;
+
+        // The path keeps its names: without them the faded frames cannot be
+        // identified and the context is useless.
+        if labels < MAX_ANCESTOR_LABELS && (qx1 - qx0) >= LABEL_MIN_W && (qy1 - qy0) >= LABEL_MIN_H
+        {
+            labels += 1;
+            out.labels.push(LabelReq {
+                frame: a,
+                // An ancestor is usually wider than the focused subtree, so its
+                // own left edge can be off screen. Anchor the name at the
+                // visible left edge instead of losing it to the clip.
+                x: qx0.max(view.x) + 2.0,
+                center_y: (qy0 + qy1) * 0.5,
+                faded: true,
+            });
+        }
+    }
+}
+
+/// Emit one viewport pass over a range of rows, honouring the vertical LOD and
+/// the absolute quad limit.
+#[allow(clippy::too_many_arguments)]
+fn emit_levels(
+    scene: &Scene,
+    vp: &Viewport,
+    view: ScreenRect,
+    levels: std::ops::Range<usize>,
+    gx0: f64,
+    gx1: f64,
+    limit: usize,
+    name_colors: Option<&[u32]>,
+    quads: &mut Vec<Quad>,
+    mut labels: Option<&mut Vec<LabelReq>>,
+    stats: &mut Stats,
+) {
+    stats.rows_visited += levels.len() as u32;
+    if levels.is_empty() || gx1 <= gx0 {
+        return;
     }
 
     // Vertical LOD: when rows are thinner than a pixel, step over them.
@@ -339,14 +495,12 @@ pub fn build(
     } else {
         ((MIN_ROW_PX as f64) / row_px).ceil().max(1.0) as usize
     };
-    stats.row_step = step as u32;
+    stats.row_step = stats.row_step.max(step as u32);
 
     let drawn_rows = levels.len().div_ceil(step).max(1);
     // Guard against a pathological zoom-out where every row is sub-pixel.
-    let per_row = (budget / drawn_rows).max(MIN_PER_ROW);
+    let per_row = (limit.saturating_sub(quads.len()) / drawn_rows).max(MIN_PER_ROW);
     let label_cap = (LABEL_BUDGET / drawn_rows).max(4);
-
-    let budget_u = budget as u32;
 
     let mut li = levels.start;
     while li < levels.end {
@@ -381,17 +535,13 @@ pub fn build(
             bottom,
             &rb,
             name_colors,
-            budget_u,
+            limit,
             quads,
-            labels,
-            &mut stats,
+            labels.as_deref_mut(),
+            stats,
         );
         li += step;
     }
-
-    stats.quads = quads.len() as u32;
-    stats.labels = labels.len() as u32;
-    stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,9 +553,9 @@ fn emit_row(
     sy1: f32,
     rb: &RowBudget,
     name_colors: Option<&[u32]>,
-    budget: u32,
+    limit: usize,
     quads: &mut Vec<Quad>,
-    labels: &mut Vec<LabelReq>,
+    mut labels: Option<&mut Vec<LabelReq>>,
     stats: &mut Stats,
 ) {
     let frames = &scene.frames;
@@ -438,7 +588,7 @@ fn emit_row(
         }
 
         if let Some(r) = run.take() {
-            if quads.len() < budget as usize {
+            if quads.len() < limit {
                 quads.push(Quad {
                     x0: r.0,
                     y0: sy0,
@@ -450,7 +600,7 @@ fn emit_row(
                 stats.dropped += 1;
             }
         }
-        if quads.len() < budget as usize {
+        if quads.len() < limit {
             quads.push(Quad {
                 x0: sx0,
                 y0: sy0,
@@ -464,18 +614,21 @@ fn emit_row(
             continue;
         }
 
-        if wpx >= LABEL_MIN_W && (sy1 - sy0) >= LABEL_MIN_H && row_labels < rb.label_cap {
-            row_labels += 1;
-            labels.push(LabelReq {
-                frame: idx as u32,
-                x: sx0 + 2.0,
-                center_y: (sy0 + sy1) * 0.5,
-            });
+        if let Some(labels) = labels.as_deref_mut() {
+            if wpx >= LABEL_MIN_W && (sy1 - sy0) >= LABEL_MIN_H && row_labels < rb.label_cap {
+                row_labels += 1;
+                labels.push(LabelReq {
+                    frame: idx as u32,
+                    x: sx0 + 2.0,
+                    center_y: (sy0 + sy1) * 0.5,
+                    faded: false,
+                });
+            }
         }
     }
 
     if let Some(r) = run.take() {
-        if quads.len() < budget as usize {
+        if quads.len() < limit {
             quads.push(Quad {
                 x0: r.0,
                 y0: sy0,
@@ -526,6 +679,94 @@ mod tests {
         Scene::build(v, names, "t".into(), "mem".into(), 0, 0.0, [0.0, 0.0])
     }
 
+    fn geom(scene: &Scene, vp: &Viewport, view: ScreenRect, focus: Option<Focus>) -> Geometry {
+        let mut g = Geometry::default();
+        build(scene, vp, view, DEFAULT_BUDGET, None, focus, &mut g);
+        g
+    }
+
+    /// The row of a frame, in graph units.
+    fn row_of(scene: &Scene, frame: u32) -> f32 {
+        scene.frames[frame as usize].y
+    }
+
+    /// A tree where one branch stops early while the graph keeps going: the case
+    /// where using the graph's global depth for the fit corners the content.
+    fn uneven_tree() -> Scene {
+        fn row(v: &mut Vec<Frame>, x: f64, w: f64, r: f32) {
+            v.push(Frame {
+                x,
+                w,
+                y: r * 15.0,
+                h: 15.0,
+                color: 0x80_40_20,
+                name: 0,
+            });
+        }
+        let mut v = Vec::new();
+        row(&mut v, 0.0, 500.0, 0.0); // A
+        row(&mut v, 500.0, 500.0, 0.0); // B
+        row(&mut v, 0.0, 10.0, 1.0); // A1, narrow and about to be focused
+        row(&mut v, 10.0, 490.0, 1.0); // A2
+        row(&mut v, 500.0, 500.0, 1.0); // B1
+        for r in 2..6 {
+            row(&mut v, 500.0, 500.0, r as f32); // only B keeps going deeper
+        }
+        Scene::build(
+            v,
+            vec!["fn".into()],
+            "t".into(),
+            "mem".into(),
+            0,
+            0.0,
+            [0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn focus_frames_the_subtree_and_its_path_together() {
+        let scene = uneven_tree();
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 15.0 && f.x == 0.0)
+            .expect("A1 exists") as u32;
+        let focus = Focus::of(&scene, target);
+        assert_eq!(focus.level, 1);
+        // A1 has no calls below it, while the graph runs four more rows deep.
+        assert_eq!(scene.subtree_max_y(target), 30.0);
+
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let g = geom(&scene, &vp, view, Some(focus));
+
+        // Everything drawn - the faded path and the bright subtree - has to fill
+        // the viewport instead of huddling in a corner.
+        let ys: Vec<f32> = g
+            .quads
+            .iter()
+            .chain(g.faded.iter())
+            .flat_map(|q| [q.y0, q.y1])
+            .collect();
+        assert!(!ys.is_empty());
+        let top = ys.iter().copied().fold(f32::MAX, f32::min);
+        let bottom = ys.iter().copied().fold(f32::MIN, f32::max);
+        let span = bottom - top;
+        assert!(
+            span >= view.h * 0.8,
+            "the focused view used {span:.0}px of {:.0}px: the content is cornered",
+            view.h
+        );
+
+        // Both halves are framed: the path above and the subtree itself.
+        assert!(
+            !g.faded.is_empty(),
+            "the path above the focus was not framed"
+        );
+        assert!(g.stats.rows_drawn >= 1, "the subtree was not framed");
+    }
+
     #[test]
     fn fit_places_the_graph_inside_an_offset_viewport() {
         // Wide enough that fitting by width would leave every row sub-pixel, so
@@ -557,70 +798,166 @@ mod tests {
                 "graph [{top}, {bottom}] does not intersect the view (flip {flip})"
             );
 
-            let mut quads = Vec::new();
-            let mut labels = Vec::new();
-            let st = build(
-                &scene,
-                &vp,
-                view,
-                DEFAULT_BUDGET,
-                None,
-                None,
-                &mut quads,
-                &mut labels,
-            );
+            let g = geom(&scene, &vp, view, None);
             assert!(
-                st.quads > 0,
+                g.stats.quads > 0,
                 "fitted view produced no geometry (flip {flip})"
             );
             assert!(
-                st.frames_considered > 0,
+                g.stats.frames_considered > 0,
                 "fitted view considered no frames (flip {flip})"
             );
         }
     }
 
     #[test]
-    fn focus_draws_only_the_subtree() {
-        let scene = synthetic(4_000, 100);
+    fn focus_keeps_the_calls_below() {
+        // 12 rows of 20 frames: a grid, so every frame has calls below it.
+        let scene = synthetic(240, 20);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 30.0)
+            .expect("row 2 exists") as u32;
+        let focus = Focus::of(&scene, target);
+        assert_eq!(focus.level, 2);
+
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let g = geom(&scene, &vp, view, Some(focus));
+
+        // The calls below the focused frame are expanded, not hidden. Labels
+        // carry frame indices, so they prove what actually got drawn.
+        let deepest = g
+            .labels
+            .iter()
+            .filter(|l| !l.faded)
+            .map(|l| row_of(&scene, l.frame))
+            .fold(f32::MIN, f32::max);
+        assert!(
+            deepest > focus.y0 + 15.0,
+            "nothing below the focused row was drawn: deepest labelled row {deepest}, focus row {}",
+            focus.y0
+        );
+        assert!(
+            g.stats.rows_drawn >= 8,
+            "only {} rows drawn, the subtree was not expanded",
+            g.stats.rows_drawn
+        );
+    }
+
+    #[test]
+    fn focus_fades_only_the_path_to_the_root() {
+        // Shallow and wide, so fitting the focused frame by width leaves vertical
+        // room for the path above it to stay on screen.
+        let scene = synthetic_wide(60, 20, 4000.0);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 15.0)
+            .expect("row 1 exists") as u32;
+        let focus = Focus::of(&scene, target);
+        assert_eq!(focus.level, 1);
+
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let g = geom(&scene, &vp, view, Some(focus));
+
+        let expected: Vec<u32> = scene
+            .ancestry(target)
+            .into_iter()
+            .filter(|a| *a != target)
+            .collect();
+        assert!(!expected.is_empty(), "the fixture needs an ancestor");
+
+        // Only the dependency path is faded - not the whole row it sits on.
+        let faded_frames: Vec<u32> = g
+            .labels
+            .iter()
+            .filter(|l| l.faded)
+            .map(|l| l.frame)
+            .collect();
+        assert_eq!(faded_frames, expected, "the faded set is not the call path");
+        assert_eq!(
+            g.faded.len(),
+            expected.len(),
+            "faded quads are not the call path"
+        );
+
+        // ... and every faded frame keeps its name.
+        for l in g.labels.iter().filter(|l| l.faded) {
+            assert!(
+                !scene.name_of(l.frame).is_empty(),
+                "a faded frame lost its label"
+            );
+        }
+        // Nothing on the path is drawn at full strength.
+        for l in g.labels.iter().filter(|l| !l.faded) {
+            assert!(
+                row_of(&scene, l.frame) >= focus.y0,
+                "a row above the focus was drawn at full strength"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_never_draws_outside_the_subtree() {
+        let scene = synthetic(240, 20);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
         let target = scene
             .frames
             .iter()
-            .position(|f| f.y > 0.0)
-            .expect("non empty") as u32;
+            .position(|f| f.y == 30.0)
+            .expect("row 2 exists") as u32;
         let focus = Focus::of(&scene, target);
         let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
-        assert_eq!(focus.level, 1);
 
-        let mut quads = Vec::new();
-        let mut labels = Vec::new();
-        let st = build(
-            &scene,
-            &vp,
-            view,
-            DEFAULT_BUDGET,
-            None,
-            Some(focus),
-            &mut quads,
-            &mut labels,
-        );
-        assert!(st.quads > 0, "focused view produced no geometry");
-
-        let st_all = build(
-            &scene,
-            &vp,
-            view,
-            DEFAULT_BUDGET,
-            None,
-            None,
-            &mut quads,
-            &mut labels,
-        );
+        let g = geom(&scene, &vp, view, Some(focus));
+        // Every bright label must sit on or below the focus row; the faded ones
+        // must sit above it.
+        for l in &g.labels {
+            if l.faded {
+                assert!(
+                    row_of(&scene, l.frame) < focus.y0,
+                    "a faded label sits below the focus row"
+                );
+            } else {
+                assert!(
+                    row_of(&scene, l.frame) >= focus.y0,
+                    "a row above the focus was drawn at full strength"
+                );
+            }
+        }
+        // And framing the same subtree must never cost more than the whole graph.
+        let all = geom(&scene, &vp, view, None);
         assert!(
-            st_all.frames_considered >= st.frames_considered,
-            "focus must never increase the work"
+            all.stats.frames_considered >= g.stats.frames_considered,
+            "focusing increased the work"
         );
+    }
+
+    #[test]
+    fn focus_keeps_the_quad_budget() {
+        let scene = synthetic(200_000, 400);
+        let view = ScreenRect::new(1.0, 64.0, 1599.0, 836.0);
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 15.0)
+            .expect("row 1 exists") as u32;
+        let focus = Focus::of(&scene, target);
+        for bounds in [Bounds::scene(&scene), focus.bounds(&scene)] {
+            let vp = fit(&scene, view, 14.0, bounds, false);
+            let g = geom(&scene, &vp, view, Some(focus));
+            assert!(
+                g.len() <= DEFAULT_BUDGET,
+                "emitted {} quads with a budget of {DEFAULT_BUDGET}",
+                g.len()
+            );
+            assert_eq!(g.stats.dropped, 0, "the geometry budget was exceeded");
+        }
     }
 
     #[test]
@@ -645,8 +982,6 @@ mod tests {
     fn culling_never_exceeds_budget() {
         let scene = synthetic(200_000, 400);
         let view = ScreenRect::new(0.0, 0.0, 1600.0, 900.0);
-        let mut quads = Vec::new();
-        let mut labels = Vec::new();
         for zoom in [0.001f64, 0.01, 0.1, 0.5, 1.0, 4.0, 40.0] {
             for flip in [false, true] {
                 let vp = Viewport {
@@ -655,22 +990,13 @@ mod tests {
                     scale: zoom,
                     flip_y: flip,
                 };
-                let st = build(
-                    &scene,
-                    &vp,
-                    view,
-                    DEFAULT_BUDGET,
-                    None,
-                    None,
-                    &mut quads,
-                    &mut labels,
-                );
+                let g = geom(&scene, &vp, view, None);
                 assert!(
-                    quads.len() <= DEFAULT_BUDGET,
-                    "zoom {zoom} emitted {}",
-                    quads.len()
+                    g.len() <= DEFAULT_BUDGET,
+                    "zoom {zoom} emitted {} quads",
+                    g.len()
                 );
-                assert_eq!(st.dropped, 0, "zoom {zoom} dropped quads");
+                assert_eq!(g.stats.dropped, 0, "zoom {zoom} dropped quads");
             }
         }
     }
@@ -680,20 +1006,34 @@ mod tests {
         let scene = synthetic(50_000, 500);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
         let vp = fit(&scene, view, 10.0, Bounds::scene(&scene), false);
-        let mut quads = Vec::new();
-        let mut labels = Vec::new();
-        let st = build(
-            &scene,
-            &vp,
-            view,
-            DEFAULT_BUDGET,
-            None,
-            None,
-            &mut quads,
-            &mut labels,
+        let g = geom(&scene, &vp, view, None);
+        assert!(g.len() > 0);
+        assert!(g.stats.frames_considered > 0);
+    }
+
+    #[test]
+    fn focus_frame_keeps_the_context_below() {
+        let scene = synthetic(2_000, 40);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+        // A narrow frame deep in the graph: zooming it to the full width would
+        // hide everything under it.
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 300.0 && f.w < 30.0)
+            .expect("a narrow frame deep down") as u32;
+        let vp = focus_frame(&scene, target, view, false);
+        let g = geom(&scene, &vp, view, None);
+        let drawn_rows = g
+            .quads
+            .iter()
+            .map(|q| q.y0)
+            .fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        let rows = ((drawn_rows.1 - drawn_rows.0) / 15.0).ceil();
+        assert!(
+            rows >= MIN_VISIBLE_ROWS as f32 - 1.0,
+            "zooming to a frame left only {rows} rows on screen"
         );
-        assert!(!quads.is_empty());
-        assert!(st.frames_considered > 0);
     }
 
     #[test]

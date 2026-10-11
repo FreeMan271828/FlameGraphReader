@@ -6,9 +6,9 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
@@ -70,18 +70,15 @@ impl Loader {
     /// Drain finished loads without blocking.
     pub fn poll(&self) -> Vec<LoadMsg> {
         let mut out = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(m) => out.push(m),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(m) = self.rx.try_recv() {
+            out.push(m);
         }
         out
     }
 }
 
 /// Load and parse a document synchronously. Also used by the CLI modes.
-pub fn load(path: &PathBuf, progress: &Progress, cancel: &AtomicBool) -> Result<Scene, String> {
+pub fn load(path: &Path, progress: &Progress, cancel: &AtomicBool) -> Result<Scene, String> {
     let t0 = std::time::Instant::now();
     progress.set_stage(Stage::Reading);
 
@@ -147,7 +144,7 @@ pub fn load(path: &PathBuf, progress: &Progress, cancel: &AtomicBool) -> Result<
     Ok(parse_result)
 }
 
-fn finish(path: &PathBuf, parsed: svg::ParsedSvg, bytes: u64, elapsed_ms: f64) -> Scene {
+fn finish(path: &Path, parsed: svg::ParsedSvg, bytes: u64, elapsed_ms: f64) -> Scene {
     let title = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())

@@ -81,17 +81,41 @@ impl Scene {
         // Sorting by (y, x) is what makes the per-row binary searches valid.
         frames.sort_unstable_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
 
+        // Row grouping tolerance comes from the *smallest* frame height in the
+        // document. Deriving it from a single frame's height (as this used to)
+        // means one oversized rectangle - a background filled with a gradient
+        // that the parser failed to skip, say - swallows every row below it,
+        // because the tolerance becomes half the canvas height.
+        let mut min_h = f32::INFINITY;
+        for f in &frames {
+            if f.h > 0.0 && f.h < min_h {
+                min_h = f.h;
+            }
+        }
+        let tol = if min_h.is_finite() { min_h * 0.5 } else { 0.0 };
+
         let mut levels: Vec<Level> = Vec::with_capacity(64);
         let mut i = 0usize;
+        let mut sample: Vec<f32> = Vec::with_capacity(33);
         while i < frames.len() {
             let y = frames[i].y;
-            let h = frames[i].h;
-            let eps = if h > 0.0 { h * 0.5 } else { 0.0 };
             let start = i;
             i += 1;
-            while i < frames.len() && (frames[i].y - y).abs() <= eps {
+            // frames are sorted by (y, x), so y only ever grows here.
+            while i < frames.len() && frames[i].y - y <= tol {
                 i += 1;
             }
+            // The row height is the median of a sample, not the first frame's,
+            // so a single outlier cannot stretch the band either.
+            sample.clear();
+            let step = ((i - start) / 33).max(1);
+            let mut k = start;
+            while k < i {
+                sample.push(frames[k].h);
+                k += step;
+            }
+            sample.sort_by(f32::total_cmp);
+            let h = sample[sample.len() / 2];
             levels.push(Level {
                 y,
                 h,
@@ -237,6 +261,26 @@ impl Scene {
             .position(|f| x >= f.x && x <= f.x + f.w)
             .map(|p| (r.start + p) as u32)?;
         Some(idx)
+    }
+
+    /// The y of the deepest row this frame's subtree actually reaches.
+    ///
+    /// A subtree occupies one contiguous x-interval per row, so walking down
+    /// until a row has nothing inside that interval finds its true extent. Using
+    /// the graph's global depth instead would reserve vertical space for rows
+    /// the subtree never reaches, squashing it into a corner.
+    pub fn subtree_max_y(&self, frame: u32) -> f32 {
+        let f = self.frames[frame as usize];
+        let level = self.level_of(frame);
+        let mut deepest = f.y + f.h;
+        for li in (level + 1)..self.levels.len() {
+            if self.frames_in_level(li, f.x, f.x + f.w).is_empty() {
+                break;
+            }
+            let l = &self.levels[li];
+            deepest = l.y + l.h;
+        }
+        deepest
     }
 
     /// The level index that contains a frame.

@@ -475,6 +475,10 @@ struct Sink {
     pending_title: Option<String>,
     /// Rects the document declared as zero sized; they can never be drawn.
     empty_rects: usize,
+    /// Depth inside g elements. Standalone text elements (ids such as "title"
+    /// or "search" that generators emit around the graph) must never be adopted
+    /// as a frame label.
+    group_depth: u32,
 }
 
 impl Sink {
@@ -487,6 +491,7 @@ impl Sink {
             pending_text_rect: None,
             pending_title: None,
             empty_rects: 0,
+            group_depth: 0,
         };
         s.anon = s.intern(b"(anonymous)");
         s
@@ -511,7 +516,9 @@ impl Sink {
         let name = match self.pending_title.take() {
             Some(t) => self.intern(t.as_bytes()),
             None => {
-                self.pending_text_rect = Some(self.frames.len() as u32);
+                if self.group_depth > 0 {
+                    self.pending_text_rect = Some(self.frames.len() as u32);
+                }
                 self.anon
             }
         };
@@ -574,8 +581,11 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
                 let ns = i + 1;
                 let ne = tag_name_end(data, ns);
                 let name = &data[ns..ne];
-                if is_group(name) && stack.len() > 1 {
-                    stack.pop();
+                if is_group(name) {
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                    sink.group_depth = sink.group_depth.saturating_sub(1);
                 }
                 i = find_after(data, i, b">");
                 continue;
@@ -589,11 +599,15 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
         let (body_end, self_closing, after) = scan_tag(data, ne);
         i = after;
 
-        if name.eq_ignore_ascii_case(b"g") || name.eq_ignore_ascii_case(b"svg") {
+        let is_g = name.eq_ignore_ascii_case(b"g");
+        if is_g || name.eq_ignore_ascii_case(b"svg") {
             // A new group starts a new frame; the previous rect can no longer
             // pick up a label.
             sink.pending_text_rect = None;
             if !self_closing {
+                if is_g {
+                    sink.group_depth += 1;
+                }
                 let mut t = Affine::IDENTITY;
                 for_each_attr(&data[ne..body_end], |k, v| {
                     if k.eq_ignore_ascii_case(b"transform") {
@@ -612,6 +626,7 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
             let mut w = 0.0f64;
             let mut h = 0.0f64;
             let mut fill: Option<u32> = None;
+            let mut has_fill = false;
             let mut local = Affine::IDENTITY;
             for_each_attr(&data[ne..body_end], |k, v| {
                 if k.eq_ignore_ascii_case(b"x") {
@@ -623,6 +638,7 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
                 } else if k.eq_ignore_ascii_case(b"height") {
                     h = parse_f64(v).unwrap_or(0.0);
                 } else if k.eq_ignore_ascii_case(b"fill") {
+                    has_fill = true;
                     fill = paint(v);
                 } else if k.eq_ignore_ascii_case(b"transform") {
                     local = parse_transform(v);
@@ -656,12 +672,21 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
                     ay.max(by).max(cy).max(dy) as f64,
                 )
             };
-            match fill {
-                Some(c) => sink.push_rect(x0, y0, x1 - x0, y1 - y0, c),
-                None => {
+            // SVG's initial fill is black, so a rect with no fill attribute is
+            // a real frame. An explicit "none" or an unresolvable paint such as
+            // fill="url(#background)" is decoration: drawing it as a frame makes
+            // the background rect - which spans the whole canvas - swallow every
+            // row below it, because row grouping is derived from frame height.
+            let color = match fill {
+                Some(c) => c,
+                None if has_fill => {
                     sink.pending_text_rect = None;
+                    sink.pending_title = None;
+                    continue;
                 }
-            }
+                None => DEFAULT_FILL,
+            };
+            sink.push_rect(x0, y0, x1 - x0, y1 - y0, color);
             continue;
         }
 
@@ -695,12 +720,16 @@ fn parse_chunk(data: &[u8], sink: &mut Sink, progress: Option<&Progress>) {
                     None => data.len(),
                 };
                 if name.eq_ignore_ascii_case(b"text") {
-                    if let Some(idx) = sink.pending_text_rect.take() {
-                        let raw = unescape(trim(&data[start..end]));
-                        if !raw.is_empty() {
-                            let id = sink.intern(raw.as_bytes());
-                            sink.frames[idx as usize].name = id;
+                    if sink.group_depth > 0 {
+                        if let Some(idx) = sink.pending_text_rect.take() {
+                            let raw = unescape(trim(&data[start..end]));
+                            if !raw.is_empty() {
+                                let id = sink.intern(raw.as_bytes());
+                                sink.frames[idx as usize].name = id;
+                            }
                         }
+                    } else {
+                        sink.pending_text_rect = None;
                     }
                 }
                 i = find_after(data, end, b">");
@@ -763,11 +792,12 @@ fn is_group(name: &[u8]) -> bool {
 #[inline]
 fn paint(v: &[u8]) -> Option<u32> {
     let s = std::str::from_utf8(v).ok()?.trim();
-    if s.eq_ignore_ascii_case("none") || s.is_empty() {
+    if s.is_empty() {
         return None;
     }
-    let c = palette::parse_paint(s);
-    Some(c.unwrap_or(DEFAULT_FILL))
+    // Returns None for "none" and for paints we cannot resolve (gradients and
+    // patterns referenced through url()). Callers treat that as "not a frame".
+    palette::parse_paint(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -961,15 +991,7 @@ fn drop_background(frames: &mut Vec<Frame>, anon: u32) {
         return;
     }
     let cutoff = span * 0.995;
-    let mut removed_any = false;
-    frames.retain(|f| {
-        let bg = f.name == anon && f.w >= cutoff;
-        if bg {
-            removed_any = true;
-        }
-        !bg
-    });
-    let _ = removed_any;
+    frames.retain(|f| !(f.name == anon && f.w >= cutoff));
 }
 
 /// Pick split points for parallel parsing.
@@ -977,9 +999,10 @@ fn drop_background(frames: &mut Vec<Frame>, anon: u32) {
 /// Boundaries are snapped forward to an element start so that each piece is a
 /// self-contained sequence of complete elements.
 fn chunk_bounds(bytes: &[u8], threads: usize) -> Vec<Range<usize>> {
+    let whole: Vec<Range<usize>> = std::iter::once(0..bytes.len()).collect();
     let threads = threads.max(1);
     if threads == 1 {
-        return vec![0..bytes.len()];
+        return whole;
     }
     // Anchor on title elements when present, because a title carries the name of
     // the rect that follows it and must stay in the same piece.
@@ -988,7 +1011,7 @@ fn chunk_bounds(bytes: &[u8], threads: usize) -> Vec<Range<usize>> {
 
     let step = bytes.len() / threads;
     if step < 1 << 16 {
-        return vec![0..bytes.len()];
+        return whole;
     }
     let mut bounds: Vec<Range<usize>> = Vec::with_capacity(threads);
     let mut start = 0usize;
@@ -1015,4 +1038,76 @@ fn chunk_bounds(bytes: &[u8], threads: usize) -> Vec<Range<usize>> {
         bounds.push(0..bytes.len());
     }
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::Scene;
+
+    /// Shaped like real flamegraph.pl output: a gradient-filled background rect
+    /// whose paint cannot be resolved, standalone text elements with ids, a
+    /// script block wrapped in CDATA that contains "<", and two rows of frames.
+    const PL_STYLE: &str = r##"<?xml version="1.0" standalone="no"?>
+<svg version="1.1" width="1200" height="148" viewBox="0 0 1200 148" xmlns="http://www.w3.org/2000/svg">
+<defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs>
+<style type="text/css">text { font-family:Verdana; } #frames > *:hover { stroke:black; }</style>
+<script type="text/ecmascript"><![CDATA[ for (var i = 0; i < 5; i++) { if (i > 1) {} } ]]></script>
+<rect x="0.0" y="0.0" width="1200.0" height="148.0" fill="url(#background)"/>
+<text id="title" x="600.00" y="24.00">Flame Graph</text>
+<text id="details" x="10.00" y="140.00"> </text>
+<svg id="frames" x="10" width="1180">
+<g class="func_g" onmouseover="s(this)"><title>all (100 samples, 100.00%)</title><rect x="0.0" y="0.0" width="1200.0" height="15.0" fill="rgb(255,0,0)" rx="2" ry="2"/><text x="3.00" y="12.00">all</text></g>
+<g class="func_g" onmouseover="s(this)"><title>a (60 samples, 60.00%)</title><rect x="0.0" y="16.0" width="700.0" height="15.0" fill="rgb(255,60,0)" rx="2" ry="2"/><text x="3.00" y="28.00">a</text></g>
+<g class="func_g" onmouseover="s(this)"><title>b (40 samples, 40.00%)</title><rect x="700.0" y="16.0" width="500.0" height="15.0" fill="rgb(255,120,0)" rx="2" ry="2"/><text x="703.00" y="28.00">b</text></g>
+</svg></svg>"##;
+
+    fn build(src: &str) -> Scene {
+        let progress = Progress::new();
+        let parsed = parse(src.as_bytes(), &progress);
+        Scene::build(
+            parsed.frames,
+            parsed.names,
+            "t".into(),
+            "mem".into(),
+            src.len() as u64,
+            0.0,
+            [parsed.width, parsed.height],
+        )
+    }
+
+    #[test]
+    fn gradient_background_is_not_a_frame() {
+        let scene = build(PL_STYLE);
+        assert_eq!(
+            scene.frames.len(),
+            3,
+            "the url(#background) rect leaked into the frames"
+        );
+        // Row grouping derives its tolerance from frame height, so a background
+        // rect spanning the whole canvas would collapse every row into one.
+        assert_eq!(scene.levels.len(), 2, "rows were merged into one slab");
+        assert!(
+            scene.frames.iter().all(|f| f.h <= 15.0),
+            "a frame spans the whole canvas"
+        );
+    }
+
+    #[test]
+    fn standalone_text_does_not_name_a_frame() {
+        let scene = build(PL_STYLE);
+        assert_ne!(scene.name_of(0), "Flame Graph");
+        assert_eq!(scene.name_of(0), "all");
+        // "(anonymous)" is always interned first and stays in the table even
+        // when nothing references it.
+        assert_eq!(scene.names, vec!["(anonymous)", "all", "a", "b"]);
+    }
+
+    #[test]
+    fn fill_none_is_skipped_but_a_missing_fill_is_drawn() {
+        let src = r#"<svg width="100" height="40"><rect x="0" y="0" width="50" height="10" fill="none"/><rect x="0" y="20" width="50" height="10"/></svg>"#;
+        let scene = build(src);
+        assert_eq!(scene.frames.len(), 1, "fill=none must not become a frame");
+        assert_eq!(scene.frames[0].h, 10.0);
+    }
 }
