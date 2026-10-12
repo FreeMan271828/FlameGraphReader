@@ -26,6 +26,18 @@ fn pos(x: f32, y: f32) -> Pos2 {
     Pos2::new(x, y)
 }
 
+/// Dark rim drawn under every search marker, so the marker reads even when the
+/// frame it sits on is a similar colour.
+#[inline]
+fn hit_halo() -> Color32 {
+    Color32::from_rgba_unmultiplied(8, 10, 14, 235)
+}
+
+#[inline]
+fn hit_wash(core: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(core.r(), core.g(), core.b(), 64)
+}
+
 /// Alpha applied to the path above a focused subtree.
 const FADED_ALPHA: u8 = 52;
 
@@ -144,6 +156,44 @@ impl Default for FlameView {
 }
 
 impl FlameView {
+    /// The search hits that get a marker this frame, as (index, frame).
+    ///
+    /// Two filters, both of which were bugs once: only a window around the
+    /// current hit is walked, so a hit far down the list still gets its marker;
+    /// and only frames the focused view actually draws qualify, because
+    /// highlighting a culled frame left markers floating in the empty half of a
+    /// focused canvas.
+    fn markers<'a>(&'a self, scene: &'a Scene) -> impl Iterator<Item = (usize, u32)> + 'a {
+        const WINDOW: usize = 400;
+        let lo = self.current_hit.min(self.highlight.len().saturating_sub(1));
+        let lo = lo.saturating_sub(WINDOW / 2);
+        let hi = (lo + WINDOW).min(self.highlight.len());
+        let focus = self.focus;
+        (lo..hi).filter_map(move |i| {
+            let fr = self.highlight[i];
+            lod::is_focused_visible(scene, focus, &self.focus_path, fr).then_some((i, fr))
+        })
+    }
+
+    /// Resolve a pending refit.
+    ///
+    /// Split out of show() so the framing rules can be tested without a Ui: this
+    /// is where "drilling in keeps your zoom" actually lives.
+    pub fn apply_pending_fit(&mut self, scene: &Scene, view: ScreenRect) {
+        if self.initialized {
+            return;
+        }
+        let exact = std::mem::take(&mut self.exact_fit);
+        let flip = self.flip_y(scene);
+        self.vp = match self.focus {
+            // Recentre at the zoom the user is already working at. Changing the
+            // scale on every click threw away the framing they had just chosen.
+            Some(f) if !exact => lod::focus_centre(scene, f.frame, view, flip, self.vp.scale),
+            _ => lod::fit(scene, view, 14.0, self.bounds(scene), flip, exact),
+        };
+        self.initialized = true;
+    }
+
     /// Show the entire graph, even if that makes the rows sub-pixel. Explicit
     /// "fit"/"whole graph" actions mean exactly that, unlike the automatic fit
     /// on load which keeps the rows readable.
@@ -347,17 +397,7 @@ impl FlameView {
         // the user is about to see is already correct: egui only repaints on
         // input, so deferring the refit to the next frame would leave a stale
         // view on screen until the mouse moved.
-        if !self.initialized {
-            let exact = std::mem::take(&mut self.exact_fit);
-            let flip = self.flip_y(scene);
-            self.vp = match self.focus {
-                // Drilling in centres the frame and zooms to its subtree, which
-                // is what makes the parent/child relationship readable.
-                Some(f) if !exact => lod::focus_view(scene, f.frame, view, flip),
-                _ => lod::fit(scene, view, 14.0, self.bounds(scene), flip, exact),
-            };
-            self.initialized = true;
-        }
+        self.apply_pending_fit(scene, view);
 
         // ---- geometry ----------------------------------------------------
         self.build_geometry(scene, view);
@@ -390,10 +430,14 @@ impl FlameView {
         self.mesh_vertices = mesh.vertices.len();
         painter.add(Shape::mesh(mesh));
 
-        // Search highlights: one thin outline per hit, capped for sanity.
+        // Search highlights. A thin translucent outline was nearly invisible at
+        // the zoom levels people actually search at, so hits get a solid outline
+        // and the current one is washed and outlined heavily. Only a window
+        // around the current hit is walked, so a hit far down the list still
+        // gets its marker.
         if !self.highlight.is_empty() {
-            let n = self.highlight.len().min(400);
-            for (i, &fr) in self.highlight.iter().take(n).enumerate() {
+            let core = c32(self.palette.hit_rgb());
+            for (i, fr) in self.markers(scene) {
                 let r = frame_rect(&self.vp, scene, fr);
                 if r.max.x < rect.min.x
                     || r.min.x > rect.max.x
@@ -402,17 +446,17 @@ impl FlameView {
                 {
                     continue;
                 }
-                let strong = i == self.current_hit;
-                let col = if strong {
-                    Color32::from_rgb(255, 214, 64)
+                // Halo first, core on top: the dark rim is what makes the marker
+                // readable even when the frame underneath happens to be a
+                // similar hue.
+                if i == self.current_hit {
+                    painter.rect_filled(r, egui::CornerRadius::ZERO, hit_wash(core));
+                    outline(&painter, r, Stroke::new(6.0, hit_halo()));
+                    outline(&painter, r, Stroke::new(2.5, core));
                 } else {
-                    Color32::from_rgba_unmultiplied(255, 214, 64, 96)
-                };
-                outline(
-                    &painter,
-                    r,
-                    Stroke::new(if strong { 2.0 } else { 1.0 }, col),
-                );
+                    outline(&painter, r, Stroke::new(3.5, hit_halo()));
+                    outline(&painter, r, Stroke::new(1.5, core));
+                }
             }
         }
 
@@ -466,6 +510,41 @@ impl FlameView {
         self.vp = lod::focus_frame(scene, frame, self.last_view, self.flip_y(scene));
         self.initialized = true;
         self.selected = Some(frame);
+    }
+
+    /// Bring a frame into view without touching the zoom.
+    ///
+    /// Search navigation in "keep the view" mode has to respect the resolution
+    /// the user chose: it pans just far enough to show the hit and leaves the
+    /// scale alone.
+    pub fn reveal_frame(&mut self, scene: &Scene, frame: u32) {
+        let f = scene.frames[frame as usize];
+        let v = self.last_view;
+        if v.w <= 0.0 || v.h <= 0.0 {
+            return;
+        }
+        let (sx0, sx1) = (self.vp.sx(f.x), self.vp.sx(f.x + f.w));
+        let (sy0, sy1) = (self.vp.sy(f.y), self.vp.sy(f.y + f.h));
+        let (lo_x, hi_x) = (sx0.min(sx1), sx0.max(sx1));
+        let (lo_y, hi_y) = (sy0.min(sy1), sy0.max(sy1));
+        let m = 28.0f32;
+        let scale = self.vp.scale;
+        let (left, right) = (v.x + m, v.x + v.w - m);
+        let (top, bottom) = (v.y + m, v.y + v.h - m);
+
+        if hi_x > right {
+            self.vp.pan_x -= (hi_x - right) as f64 / scale;
+        } else if lo_x < left {
+            self.vp.pan_x += (left - lo_x) as f64 / scale;
+        }
+        if hi_y > bottom {
+            self.vp.pan_y -= (hi_y - bottom) as f64 / scale;
+        } else if lo_y < top {
+            self.vp.pan_y += (top - lo_y) as f64 / scale;
+        }
+
+        self.initialized = true;
+        self.exact_fit = false;
     }
 
     /// Zoom to a horizontal range at a given row (used by search navigation).
@@ -537,4 +616,117 @@ fn draw_tooltip(painter: &egui::Painter, bounds: Rect, at: Pos2, scene: &Scene, 
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 130, 145, 200)),
     );
     painter.galley(origin + pad, galley, Color32::WHITE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lod::ScreenRect;
+    use crate::scene::{Frame, Scene};
+
+    fn scene() -> Scene {
+        let f = |x: f64, w: f64, y: f32| Frame {
+            x,
+            w,
+            y,
+            h: 15.0,
+            color: 0x80_40_20,
+            name: 0,
+        };
+        let frames = vec![
+            f(0.0, 1000.0, 0.0),
+            f(0.0, 500.0, 15.0),
+            f(500.0, 500.0, 15.0),
+            f(500.0, 200.0, 30.0),
+        ];
+        Scene::build(
+            frames,
+            vec!["fn".into()],
+            "t".into(),
+            "mem".into(),
+            0,
+            0.0,
+            [0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn markers_are_only_painted_on_frames_that_are_drawn() {
+        // Frames: 0 = root [0,1000], 1 = [0,500], 2 = [500,500] sibling,
+        // 3 = [500,200] under the sibling.
+        let scene = scene();
+        let mut fv = FlameView {
+            highlight: vec![0, 1, 2, 3],
+            ..Default::default()
+        };
+        fv.set_focus(&scene, 1);
+
+        let marked: Vec<u32> = fv.markers(&scene).map(|(_, f)| f).collect();
+        assert!(marked.contains(&1), "the focused frame lost its marker");
+        assert!(
+            marked.contains(&0),
+            "the faded path is on screen, it keeps its marker"
+        );
+        assert!(
+            !marked.contains(&2) && !marked.contains(&3),
+            "a culled frame got a marker, it would float in empty space: {marked:?}"
+        );
+    }
+
+    #[test]
+    fn drilling_in_keeps_the_zoom() {
+        let scene = scene();
+        let view = ScreenRect::new(0.0, 0.0, 400.0, 200.0);
+        let mut fv = FlameView {
+            last_view: view,
+            ..Default::default()
+        };
+        fv.vp = crate::lod::fit(
+            &scene,
+            view,
+            14.0,
+            crate::lod::Bounds::scene(&scene),
+            false,
+            false,
+        );
+        fv.vp.scale *= 3.0; // as if the user had zoomed in by hand
+        let scale = fv.vp.scale;
+
+        fv.set_focus(&scene, 2);
+        fv.apply_pending_fit(&scene, view);
+
+        assert_eq!(fv.vp.scale, scale, "clicking a frame changed the zoom");
+        let f = scene.frames[2];
+        let cy = fv.vp.sy(f.y + f.h * 0.5);
+        let expected = view.y + view.h * 0.5;
+        assert!(
+            (cy - expected).abs() < 1.0,
+            "the clicked frame is not on the centre line: {cy} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn reveal_frame_keeps_the_zoom_and_pans_into_view() {
+        let scene = scene();
+        let view = ScreenRect::new(0.0, 0.0, 400.0, 200.0);
+        // Zoomed in on the left of the graph, so frame 2 hangs off the right.
+        let mut fv = FlameView {
+            last_view: view,
+            vp: crate::lod::focus_frame(&scene, 1, view, false),
+            ..Default::default()
+        };
+        let scale = fv.vp.scale;
+
+        fv.reveal_frame(&scene, 2);
+
+        // "Keep the view" means exactly that: the resolution must not change.
+        assert_eq!(fv.vp.scale, scale, "reveal changed the zoom");
+        let f = scene.frames[2];
+        let (x0, x1) = (fv.vp.sx(f.x), fv.vp.sx(f.x + f.w));
+        assert!(
+            x0 >= view.x - 0.5 && x1 <= view.x + view.w + 0.5,
+            "frame 2 was not brought into view: [{x0}, {x1}] in a {}px wide view",
+            view.w
+        );
+    }
 }

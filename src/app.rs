@@ -11,6 +11,7 @@ use eframe::egui;
 use egui::{Color32, RichText};
 
 use crate::loader::{LoadMsg, Loader};
+use crate::lod;
 use crate::palette::Palette;
 use crate::progress::Progress;
 use crate::scene::Scene;
@@ -51,6 +52,100 @@ struct Smoke {
     tick: u32,
 }
 
+/// How many ancestor chips the breadcrumb bar keeps before collapsing the rest.
+const BREADCRUMB_CHIPS: usize = 5;
+
+/// The next search hit to step to, skipping frames the focused view does not
+/// draw.
+///
+/// Stepping onto a culled hit used to pan the view to a blank patch with nothing
+/// highlighted, because the marker is only painted on frames that are drawn.
+fn next_drawn_hit(
+    hits: &[u32],
+    from: usize,
+    delta: i64,
+    drawn: &dyn Fn(u32) -> bool,
+) -> Option<usize> {
+    let n = hits.len() as i64;
+    if n == 0 {
+        return None;
+    }
+    let mut i = from as i64;
+    for _ in 0..n {
+        i = (i + delta).rem_euclid(n);
+        let idx = i as usize;
+        if drawn(hits[idx]) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// A key the viewer acts on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    Open,
+    CloseTab,
+    Details,
+    Help,
+    Unwind,
+    NextHit,
+    PrevHit,
+    ZoomIn,
+    ZoomOut,
+    Fit,
+}
+
+/// Resolve a key press into an action, or None if the viewer does not bind it.
+///
+/// The rule that used to be spread across the handler, and got it wrong: a
+/// focused text field owns the keyboard. Every plain key has to be left alone
+/// while the user is typing - Backspace is also the delete key, and consuming it
+/// for "step out of the subtree" made the search box append-only, so a typo
+/// could be added to but never corrected. Escape is the single exception: it is
+/// how you leave a field.
+fn resolve_shortcut(key: egui::Key, modifiers: egui::Modifiers, typing: bool) -> Option<Shortcut> {
+    use egui::{Key, Modifiers};
+    if modifiers.command {
+        return match key {
+            Key::O => Some(Shortcut::Open),
+            Key::W => Some(Shortcut::CloseTab),
+            Key::F => Some(Shortcut::Details),
+            _ => None,
+        };
+    }
+    if modifiers != Modifiers::NONE {
+        return None;
+    }
+    if key == Key::F1 {
+        return Some(Shortcut::Help);
+    }
+    if key == Key::Escape {
+        return Some(Shortcut::Unwind);
+    }
+    if typing {
+        return None;
+    }
+    match key {
+        Key::Backspace => Some(Shortcut::Unwind),
+        Key::N => Some(Shortcut::NextHit),
+        Key::P => Some(Shortcut::PrevHit),
+        Key::Equals | Key::Plus => Some(Shortcut::ZoomIn),
+        Key::Minus => Some(Shortcut::ZoomOut),
+        Key::Num0 | Key::F => Some(Shortcut::Fit),
+        _ => None,
+    }
+}
+
+/// What stepping to a search hit does to the view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HitNav {
+    /// Keep the current zoom and pan just enough to show the hit.
+    Reveal,
+    /// Treat the hit like a click: focus it and reframe the view.
+    Jump,
+}
+
 pub struct FlameApp {
     loader: Loader,
     docs: Vec<Doc>,
@@ -61,6 +156,7 @@ pub struct FlameApp {
     hits: Vec<u32>,
     hit_total: usize,
     hit_cursor: usize,
+    hit_nav: HitNav,
     search_ms: f64,
     last_query: String,
     query_since: Option<Instant>,
@@ -85,6 +181,7 @@ impl FlameApp {
             hits: Vec::new(),
             hit_total: 0,
             hit_cursor: 0,
+            hit_nav: HitNav::Reveal,
             search_ms: 0.0,
             last_query: String::new(),
             query_since: None,
@@ -271,24 +368,39 @@ impl FlameApp {
         if self.hits.is_empty() {
             return;
         }
-        let n = self.hits.len() as i64;
-        self.hit_cursor = (((self.hit_cursor as i64 + delta) % n + n) % n) as usize;
-        let frame = self.hits[self.hit_cursor];
-        self.reveal(frame);
-    }
-
-    fn reveal(&mut self, frame: u32) {
         let Some(scene) = self.active_scene() else {
             return;
         };
-        let f = scene.frames[frame as usize];
+        let (focus, path) = match self.docs.get(self.active) {
+            Some(d) => (d.view.focus, d.view.focus_path().to_vec()),
+            None => (None, Vec::new()),
+        };
+        let Some(i) = next_drawn_hit(&self.hits, self.hit_cursor, delta, &|f| {
+            lod::is_focused_visible(&scene, focus, &path, f)
+        }) else {
+            self.status = "no search hits inside the focused subtree".into();
+            return;
+        };
+        self.hit_cursor = i;
+        self.goto_hit(self.hits[i]);
+    }
+
+    /// Move to a search hit according to the navigation mode.
+    fn goto_hit(&mut self, frame: u32) {
+        let Some(scene) = self.active_scene() else {
+            return;
+        };
         let idx = self.active;
+        let nav = self.hit_nav;
         if let Some(doc) = self.docs.get_mut(idx) {
             doc.view.current_hit = self.hit_cursor;
             doc.view.selected = Some(frame);
-            let (x0, x1) = (f.x, f.x + f.w);
-            let (y, h) = (f.y, f.h);
-            doc.view.focus_rect_visible(x0, x1, y, h);
+            match nav {
+                // Exactly what clicking the frame does, which is what "jump to
+                // the node" means.
+                HitNav::Jump => doc.view.set_focus(&scene, frame),
+                HitNav::Reveal => doc.view.reveal_frame(&scene, frame),
+            }
         }
     }
 
@@ -338,76 +450,97 @@ impl FlameApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::Key;
         let typing = ctx.egui_wants_keyboard_input();
 
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::O)) {
-            self.pick_files(ctx);
+        // Resolve the first bound key of the frame in one place, so the
+        // text-entry rule lives in resolve_shortcut rather than being
+        // re-derived (and forgotten) at each key.
+        let mut pressed = None;
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                if pressed.is_some() {
+                    return true;
+                }
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    return true;
+                };
+                match resolve_shortcut(*key, *modifiers, typing) {
+                    Some(s) => {
+                        pressed = Some(s);
+                        false
+                    }
+                    None => true,
+                }
+            });
+        });
+        let Some(action) = pressed else {
+            self.pan_with_arrows(ctx, typing);
             return;
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::W)) {
-            let a = self.active;
-            self.close(a);
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F)) {
-            self.show_details = true;
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F1)) {
-            self.show_help = !self.show_help;
-            return;
-        }
-        // Escape (or Backspace) unwinds one step at a time: first out of the
-        // focused subtree, then off the selection. Clearing everything at once
-        // made it impossible to back out of a deep drill-down gradually.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
-            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Backspace))
-        {
-            if let Some(doc) = self.docs.get_mut(self.active) {
-                if doc.view.focus.is_some() {
-                    doc.view.clear_focus();
-                } else {
-                    doc.view.selected = None;
-                    doc.view.highlight.clear();
-                    self.hits.clear();
-                    self.hit_total = 0;
+        };
+
+        match action {
+            Shortcut::Open => self.pick_files(ctx),
+            Shortcut::CloseTab => {
+                let a = self.active;
+                self.close(a);
+            }
+            Shortcut::Details => self.show_details = true,
+            Shortcut::Help => self.show_help = !self.show_help,
+            Shortcut::Unwind => self.unwind_one_step(),
+            Shortcut::NextHit => self.step_hit(1),
+            Shortcut::PrevHit => self.step_hit(-1),
+            Shortcut::ZoomIn | Shortcut::ZoomOut | Shortcut::Fit => {
+                let idx = self.active;
+                let Some(doc) = self.docs.get_mut(idx) else {
+                    return;
+                };
+                let v = &mut doc.view;
+                let center = (
+                    v.last_view.x + v.last_view.w * 0.5,
+                    v.last_view.y + v.last_view.h * 0.5,
+                );
+                match action {
+                    Shortcut::ZoomIn => v.vp.zoom_at(center.0, center.1, 1.25),
+                    Shortcut::ZoomOut => v.vp.zoom_at(center.0, center.1, 0.8),
+                    _ => v.reset_fit(),
                 }
             }
-            return;
         }
+    }
+
+    /// Step out of the focused subtree, then off the selection.
+    ///
+    /// One step at a time: clearing everything at once made it impossible to back
+    /// out of a deep drill-down gradually.
+    fn unwind_one_step(&mut self) {
+        if let Some(doc) = self.docs.get_mut(self.active) {
+            if doc.view.focus.is_some() {
+                doc.view.clear_focus();
+            } else {
+                doc.view.selected = None;
+                doc.view.highlight.clear();
+                self.hits.clear();
+                self.hit_total = 0;
+            }
+        }
+    }
+
+    fn pan_with_arrows(&mut self, ctx: &egui::Context, typing: bool) {
         if typing {
             return;
         }
-
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::N)) {
-            self.step_hit(1);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::P)) {
-            self.step_hit(-1);
-        }
+        use egui::Key;
         let idx = self.active;
         let Some(doc) = self.docs.get_mut(idx) else {
             return;
         };
         let v = &mut doc.view;
-        let center = (
-            v.last_view.x + v.last_view.w * 0.5,
-            v.last_view.y + v.last_view.h * 0.5,
-        );
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Equals))
-            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Plus))
-        {
-            v.vp.zoom_at(center.0, center.1, 1.25);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Minus)) {
-            v.vp.zoom_at(center.0, center.1, 0.8);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Num0))
-            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F))
-        {
-            v.reset_fit();
-        }
         let pan = 60.0;
         if ctx.input(|i| i.key_down(Key::ArrowLeft)) {
             v.vp.pan_x += pan / v.vp.scale;
@@ -517,6 +650,15 @@ impl FlameApp {
                 }
                 if ui.small_button(">").clicked() {
                     self.step_hit(1);
+                }
+                let jump = self.hit_nav == HitNav::Jump;
+                let tip = "Off: stepping keeps your zoom and only pans the hit into view.\nOn: stepping treats a hit like a click - it is focused and the view is reframed.";
+                if ui
+                    .selectable_label(jump, "jump")
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.hit_nav = if jump { HitNav::Reveal } else { HitNav::Jump };
                 }
             } else if !self.query.trim().is_empty() && self.last_query == self.query {
                 ui.label(RichText::new("no matches").color(Color32::from_gray(140)));
@@ -760,6 +902,25 @@ impl FlameApp {
         if self.hits.is_empty() {
             ui.label(RichText::new("Type in the search box above.").color(Color32::from_gray(150)));
         } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("n / p").color(Color32::from_gray(150)));
+                let mut jump = self.hit_nav == HitNav::Jump;
+                if ui
+                    .selectable_label(!jump, "keep view")
+                    .on_hover_text("Keep the zoom, pan the hit into view")
+                    .clicked()
+                {
+                    jump = false;
+                }
+                if ui
+                    .selectable_label(jump, "jump to node")
+                    .on_hover_text("Same as clicking the node: centred and zoomed to")
+                    .clicked()
+                {
+                    jump = true;
+                }
+                self.hit_nav = if jump { HitNav::Jump } else { HitNav::Reveal };
+            });
             let total = self.hits.len();
             let cursor = self.hit_cursor;
             let mut go: Option<usize> = None;
@@ -782,7 +943,7 @@ impl FlameApp {
             if let Some(i) = go {
                 self.hit_cursor = i;
                 let fr = self.hits[i];
-                self.reveal(fr);
+                self.goto_hit(fr);
             }
         }
         let _ = ctx;
@@ -801,7 +962,11 @@ impl FlameApp {
         let path: Vec<u32> = doc.view.focus_path().to_vec();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Path:").color(Color32::from_gray(140)));
+            // Node chips only, no "Path:" prefix and no ">" separators: the path
+            // itself is already drawn in the graph, so what the bar is for is
+            // picking a node. A deep chain used to run past the end of the bar
+            // and push the buttons off it, so the middle collapses into one
+            // step-up chip.
             let all = ui.selectable_label(focus.is_none(), "all");
             if all.clicked() {
                 if let Some(d) = self.docs.get_mut(idx) {
@@ -811,8 +976,24 @@ impl FlameApp {
                 self.status = "showing the whole graph".into();
                 return;
             }
-            for (i, frame) in path.iter().enumerate() {
-                ui.label(RichText::new(">").color(Color32::from_gray(110)));
+
+            let hidden = path.len().saturating_sub(BREADCRUMB_CHIPS);
+            if hidden > 0 {
+                let up = path[hidden - 1];
+                if ui
+                    .button(RichText::new(format!("… {hidden}")).color(Color32::from_gray(160)))
+                    .on_hover_text("Go up one level")
+                    .clicked()
+                {
+                    if let Some(d) = self.docs.get_mut(idx) {
+                        d.view.set_focus(&scene, up);
+                    }
+                    self.status = format!("showing only the subtree below {}", scene.name_of(up));
+                    return;
+                }
+            }
+
+            for (i, frame) in path.iter().enumerate().skip(hidden) {
                 let last = i + 1 == path.len();
                 let label = scene.name_of(*frame);
                 let short = if label.chars().count() > 42 {
@@ -821,6 +1002,7 @@ impl FlameApp {
                 } else {
                     label.to_string()
                 };
+                ui.add_space(2.0);
                 if ui.selectable_label(last, short).clicked() && !last {
                     if let Some(d) = self.docs.get_mut(idx) {
                         d.view.set_focus(&scene, *frame);
@@ -1066,4 +1248,95 @@ fn report_frame_times(times: &[f32], scene: Option<&Scene>, doc: Option<&Doc>) -
         sorted[sorted.len() - 1]
     ));
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Key, Modifiers};
+
+    #[test]
+    fn a_focused_search_box_owns_the_keyboard() {
+        // The bug this pins down: Backspace is the delete key, and the viewer
+        // also bound it to "step out of the subtree". Consuming it while a text
+        // field had focus made the search box append-only.
+        assert_eq!(
+            resolve_shortcut(Key::Backspace, Modifiers::NONE, true),
+            None,
+            "Backspace was swallowed while typing"
+        );
+        assert_eq!(
+            resolve_shortcut(Key::Backspace, Modifiers::NONE, false),
+            Some(Shortcut::Unwind)
+        );
+
+        // Plain characters must reach the field too.
+        for k in [
+            Key::N,
+            Key::P,
+            Key::F,
+            Key::Num0,
+            Key::Equals,
+            Key::Plus,
+            Key::Minus,
+        ] {
+            assert_eq!(
+                resolve_shortcut(k, Modifiers::NONE, true),
+                None,
+                "{k:?} was swallowed while typing"
+            );
+            assert!(
+                resolve_shortcut(k, Modifiers::NONE, false).is_some(),
+                "{k:?} is not bound at all"
+            );
+        }
+
+        // Escape is the one key that always applies: it is how you leave a field.
+        assert_eq!(
+            resolve_shortcut(Key::Escape, Modifiers::NONE, true),
+            Some(Shortcut::Unwind)
+        );
+    }
+
+    #[test]
+    fn stepping_skips_hits_that_are_not_on_screen() {
+        let hits = [1u32, 2, 3, 4, 5];
+        // Only 3 and 5 are drawn in the current view.
+        let drawn = |f: u32| f == 3 || f == 5;
+
+        // From 0, forward: 2 is skipped, 3 is taken.
+        assert_eq!(next_drawn_hit(&hits, 0, 1, &drawn), Some(2));
+        // From there, forward again: 4 is skipped, 5 is taken.
+        assert_eq!(next_drawn_hit(&hits, 2, 1, &drawn), Some(4));
+        // And it wraps past the end back to 3.
+        assert_eq!(next_drawn_hit(&hits, 4, 1, &drawn), Some(2));
+        // Backwards skips the other way.
+        assert_eq!(next_drawn_hit(&hits, 2, -1, &drawn), Some(4));
+
+        // Nothing on screen: report rather than land on a blank patch.
+        assert_eq!(next_drawn_hit(&hits, 0, 1, &|_| false), None);
+        assert_eq!(next_drawn_hit(&[], 0, 1, &drawn), None);
+    }
+
+    #[test]
+    fn command_shortcuts_are_not_confused_with_plain_keys() {
+        assert_eq!(
+            resolve_shortcut(Key::O, Modifiers::COMMAND, true),
+            Some(Shortcut::Open)
+        );
+        assert_eq!(
+            resolve_shortcut(Key::F, Modifiers::COMMAND, true),
+            Some(Shortcut::Details)
+        );
+        // Plain F is "fit", Ctrl+F is "show the search panel".
+        assert_eq!(
+            resolve_shortcut(Key::F, Modifiers::NONE, false),
+            Some(Shortcut::Fit)
+        );
+        assert_eq!(resolve_shortcut(Key::O, Modifiers::NONE, false), None);
+        assert_eq!(
+            resolve_shortcut(Key::F1, Modifiers::NONE, true),
+            Some(Shortcut::Help)
+        );
+    }
 }

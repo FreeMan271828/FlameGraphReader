@@ -60,6 +60,23 @@ impl Palette {
         }
     }
 
+    /// Colour for search-hit markers.
+    ///
+    /// It has to sit *opposite* whatever the palette draws, or it disappears:
+    /// the original amber marker on the amber/red default ramp was reported as
+    /// invisible, and a cool marker would vanish just as badly on the green or
+    /// blue palettes. So each palette names its own.
+    pub fn hit_rgb(self) -> u32 {
+        match self {
+            // The document's own colours are unknown, but flame graph SVGs are
+            // overwhelmingly warm, so a cool marker plus the dark halo the
+            // renderer puts round it is the safe choice.
+            Palette::Native | Palette::Hot => 0x22_d3_ee,
+            Palette::Mem => 0xf4_72_b6,
+            Palette::Io | Palette::Cold | Palette::Flat => 0xff_b0_2e,
+        }
+    }
+
     /// Colour for a frame, given its name (for hashing) and its native colour.
     pub fn color(self, name: &str, native: u32) -> u32 {
         let v = name_hash(name);
@@ -201,4 +218,54 @@ pub fn parse_paint(s: &str) -> Option<u32> {
         return None;
     }
     parse_color(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dist(a: u32, b: u32) -> f32 {
+        let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
+        let dr = ch(a, 16) - ch(b, 16);
+        let dg = ch(a, 8) - ch(b, 8);
+        let db = ch(a, 0) - ch(b, 0);
+        (dr * dr + dg * dg + db * db).sqrt()
+    }
+
+    #[test]
+    fn a_hit_marker_never_blends_into_the_palette() {
+        for p in Palette::ALL {
+            // Native draws whatever the document says, so there is nothing to
+            // compare against; the renderer's dark halo covers that case.
+            if p == Palette::Native {
+                continue;
+            }
+            let hit = p.hit_rgb();
+            let mut closest = f32::MAX;
+            for i in 0..512 {
+                let c = p.color(&format!("f{i}"), 0x80_40_20);
+                closest = closest.min(dist(hit, c));
+            }
+            assert!(
+                closest > 100.0,
+                "{}: the hit marker is only {closest:.0} away from a frame colour",
+                p.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_amber_marker_would_fail_that_check() {
+        // The exact regression: amber on the amber/red ramp was invisible.
+        let amber = 0xff_e2_5c;
+        let mut closest = f32::MAX;
+        for i in 0..512 {
+            let c = Palette::Hot.color(&format!("f{i}"), 0x80_40_20);
+            closest = closest.min(dist(amber, c));
+        }
+        assert!(
+            closest < 100.0,
+            "the test is not actually checking anything: closest {closest:.0}"
+        );
+    }
 }

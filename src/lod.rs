@@ -145,25 +145,30 @@ pub fn flip_for(root_at_bottom: bool, scene: &Scene) -> bool {
     root_at_bottom == scene.root_at_top
 }
 
-/// Whether a frame is part of the focused view.
+/// Whether a frame is part of the focused view: drawn, and therefore also
+/// hoverable and clickable.
 ///
-/// After focusing, the only frames on screen are the path from the root down to
-/// the focused frame (faded) and the subtree below it (full strength). Hit
-/// testing has to agree with that exactly, otherwise the empty space around a
-/// focused subtree still lights up frames that were culled away - the sibling
-/// rows above the focus used to be hoverable because "above the focus row" was
-/// mistaken for "on the path".
+/// Exactly two things are on screen once a frame is focused:
+///
+/// * the subtree below it, at full strength - found by the same x-interval test
+///   the bright pass uses, since a subtree occupies one contiguous interval per
+///   row;
+/// * the faded path from the root down to it.
+///
+/// Everything else was culled, and the empty space around a focused subtree must
+/// be genuinely empty: the sibling rows above the focus used to light up because
+/// "above the focus row" was mistaken for "on the path".
+///
+/// The faded path is a target as well, not just decoration: clicking an ancestor
+/// is how you walk back up one level, matching the breadcrumb.
 pub fn is_focused_visible(scene: &Scene, focus: Option<Focus>, path: &[u32], frame: u32) -> bool {
     let Some(f) = focus else {
         return true;
     };
-    if frame == f.frame || path.contains(&frame) {
+    if path.contains(&frame) {
         return true;
     }
     let hf = scene.frames[frame as usize];
-    // Inside the subtree: at or below the focus row, overlapping its x-interval.
-    // A subtree occupies exactly that interval on every row, so this is the same
-    // test the bright pass uses.
     hf.y >= f.y0 && hf.x < f.x1 && hf.x + hf.w > f.x0
 }
 
@@ -358,35 +363,26 @@ pub fn fit(
     vp
 }
 
-/// The tallest a row is allowed to get when framing a focused frame. A leaf has
-/// no descendants to show, so without a cap the subtree would be one row blown
-/// up to half the viewport.
-const MAX_FOCUS_ROW_PX: f64 = 30.0;
-
-/// Frame a focused frame the way a drill-down should feel.
+/// Centre a focused frame in the viewport without touching the zoom.
 ///
-/// The frame lands in the middle of the viewport, its subtree fills the half the
-/// rows grow into, and the path it came from fades off on the other side. That
-/// keeps both halves of the answer on screen: what this call does, and where it
-/// was called from.
-pub fn focus_view(scene: &Scene, frame: u32, view: ScreenRect, flip_y: bool) -> Viewport {
+/// Drilling in is about *what* is drawn, not about how far in you are: the scale
+/// the user picked has to survive the click, otherwise every level loses the
+/// framing the previous one was studied at. The frame lands on the centre line,
+/// so its subtree grows into one half and the path it came from fades into the
+/// other - which is what keeps the parent/child relationship readable.
+pub fn focus_centre(
+    scene: &Scene,
+    frame: u32,
+    view: ScreenRect,
+    flip_y: bool,
+    scale: f64,
+) -> Viewport {
     let f = scene.frames[frame as usize];
-    let row_h = scene
-        .levels
-        .first()
-        .map(|l| l.h as f64)
-        .unwrap_or(16.0)
-        .max(1e-9);
-    let sub_rows = scene.subtree_rows(frame) as f64;
-
-    let margin = 14.0f64;
-    let half = ((view.h as f64) * 0.5 - margin).max(1.0);
-    let avail_w = (view.w as f64 - margin * 2.0).max(1.0);
-    let scale = (half / (sub_rows * row_h))
-        .min(avail_w / f.w.max(1e-9))
-        .min(MAX_FOCUS_ROW_PX / row_h)
-        .max(1e-12);
-
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
     let dir = if flip_y { -1.0 } else { 1.0 };
     let centre_x = view.x as f64 + view.w as f64 * 0.5;
     let centre_y = view.y as f64 + view.h as f64 * 0.5;
@@ -1036,12 +1032,12 @@ mod tests {
         let focus = Focus::of(&scene, target);
         let path = scene.ancestry(target);
 
-        // The focused frame and every frame on the path above it are hittable.
-        assert!(is_focused_visible(&scene, Some(focus), &path, target));
+        // The focused frame and every frame on the path above it are targets:
+        // clicking an ancestor walks back up one level.
         for a in &path {
             assert!(
                 is_focused_visible(&scene, Some(focus), &path, *a),
-                "path frame {a} is not hittable"
+                "path frame {a} is not clickable"
             );
         }
 
@@ -1400,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_view_centres_the_frame_and_splits_the_halves() {
+    fn focus_centre_keeps_the_zoom_and_centres_the_frame() {
         let scene = synthetic(240, 20);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
         let target = scene
@@ -1411,7 +1407,10 @@ mod tests {
         let row = scene.frames[target as usize];
 
         // Root at the bottom: the subtree grows upwards, the path fades below.
-        let vp = focus_view(&scene, target, view, true);
+        // The scale is whatever the user was working at, and must survive.
+        let scale = 2.0;
+        let vp = focus_centre(&scene, target, view, true, scale);
+        assert_eq!(vp.scale, scale, "drilling in changed the zoom");
 
         let cx = vp.sx(row.x + row.w * 0.5);
         let cy = vp.sy(row.y + row.h * 0.5);
@@ -1440,9 +1439,14 @@ mod tests {
             "the subtree runs off the top of the view"
         );
 
-        // Drilling in must zoom in, not out.
-        let row_px = row.h as f64 * vp.scale;
-        assert!(row_px > 8.0, "rows are only {row_px:.1}px after focusing");
+        // The same layout holds at any zoom, which is the point of not touching
+        // the scale on the way in.
+        let far = focus_centre(&scene, target, view, true, scale * 4.0);
+        assert_eq!(far.scale, scale * 4.0);
+        assert!(
+            (far.sy(row.y + row.h * 0.5) - (view.y + view.h * 0.5)).abs() < 1.0,
+            "the frame fell off the centre line at another zoom"
+        );
     }
 
     #[test]
