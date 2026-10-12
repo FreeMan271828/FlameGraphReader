@@ -270,17 +270,24 @@ impl Scene {
     /// the graph's global depth instead would reserve vertical space for rows
     /// the subtree never reaches, squashing it into a corner.
     pub fn subtree_max_y(&self, frame: u32) -> f32 {
+        let level = self.level_of(frame);
+        let last = (level + self.subtree_rows(frame) - 1).min(self.levels.len() - 1);
+        let l = &self.levels[last];
+        l.y + l.h
+    }
+
+    /// How many rows the subtree under a frame spans, including its own.
+    pub fn subtree_rows(&self, frame: u32) -> usize {
         let f = self.frames[frame as usize];
         let level = self.level_of(frame);
-        let mut deepest = f.y + f.h;
+        let mut rows = 1usize;
         for li in (level + 1)..self.levels.len() {
             if self.frames_in_level(li, f.x, f.x + f.w).is_empty() {
                 break;
             }
-            let l = &self.levels[li];
-            deepest = l.y + l.h;
+            rows += 1;
         }
-        deepest
+        rows
     }
 
     /// The level index that contains a frame.

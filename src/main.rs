@@ -524,7 +524,9 @@ fn make_view(scene: &Scene) -> (FlameView, ScreenRect) {
     let view = ScreenRect::new(1.0, 64.0, 1599.0, 836.0);
     let mut fv = FlameView::default();
     fv.budget = DEFAULT_BUDGET;
-    fv.vp = lod::fit(scene, view, 14.0, lod::Bounds::scene(scene), false);
+    // The readable fit, not the exact one: the report is about what the viewer
+    // actually shows when a document is opened.
+    fv.vp = lod::fit(scene, view, 14.0, lod::Bounds::scene(scene), false, false);
     // Warm up so palette colour tables are not charged to the measurement.
     fv.build_geometry(scene, view);
     (fv, view)

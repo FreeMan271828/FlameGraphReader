@@ -132,6 +132,19 @@ impl Focus {
     }
 }
 
+/// Whether the rows have to be mirrored to put the widest row where the user
+/// asked for it.
+///
+/// This is an absolute comparison rather than a one-way "flip it if it is upside
+/// down": the orientation toggle has to change the picture for every document,
+/// including ones that already happen to be rooted at the bottom.
+#[inline]
+pub fn flip_for(root_at_bottom: bool, scene: &Scene) -> bool {
+    // The document's own position expressed the same way, so the comparison is
+    // apples to apples: mirror only when the two disagree.
+    root_at_bottom == scene.root_at_top
+}
+
 /// Whether a frame is part of the focused view.
 ///
 /// After focusing, the only frames on screen are the path from the root down to
@@ -287,7 +300,18 @@ pub struct Stats {
 /// pixel tall sliver: fitting the width there makes every row sub-pixel. When
 /// that happens the view is zoomed in just enough for the rows to be legible,
 /// anchored at the edge the graph is read from, which is where the root is.
-pub fn fit(scene: &Scene, view: ScreenRect, margin: f32, bounds: Bounds, flip_y: bool) -> Viewport {
+///
+/// Pass exact = true to skip that clamp. An explicit "fit" or "whole graph"
+/// action has to show the entire graph even when it ends up a sliver; the
+/// automatic fit on load and on zoom-to-frame keeps the rows readable.
+pub fn fit(
+    scene: &Scene,
+    view: ScreenRect,
+    margin: f32,
+    bounds: Bounds,
+    flip_y: bool,
+    exact: bool,
+) -> Viewport {
     let w = bounds.width().max(1e-9);
     let h = (bounds.height() as f64).max(1e-9);
     let avail_w = ((view.w - margin * 2.0) as f64).max(1.0);
@@ -316,7 +340,7 @@ pub fn fit(scene: &Scene, view: ScreenRect, margin: f32, bounds: Bounds, flip_y:
         .unwrap_or(16.0)
         .max(1e-9);
     let legible = MIN_FIT_ROW_PX as f64 / row_h;
-    if vp.scale < legible {
+    if !exact && vp.scale < legible {
         // Re-place rather than zoom about a point: the fitted graph can be only
         // a few pixels tall here, so there is no on-graph point that would leave
         // the rows in view. Instead pin the root row to the edge the rows grow
@@ -332,6 +356,46 @@ pub fn fit(scene: &Scene, view: ScreenRect, margin: f32, bounds: Bounds, flip_y:
         vp.pan_y = root_y / vp.scale - dir * bounds.y0 as f64;
     }
     vp
+}
+
+/// The tallest a row is allowed to get when framing a focused frame. A leaf has
+/// no descendants to show, so without a cap the subtree would be one row blown
+/// up to half the viewport.
+const MAX_FOCUS_ROW_PX: f64 = 30.0;
+
+/// Frame a focused frame the way a drill-down should feel.
+///
+/// The frame lands in the middle of the viewport, its subtree fills the half the
+/// rows grow into, and the path it came from fades off on the other side. That
+/// keeps both halves of the answer on screen: what this call does, and where it
+/// was called from.
+pub fn focus_view(scene: &Scene, frame: u32, view: ScreenRect, flip_y: bool) -> Viewport {
+    let f = scene.frames[frame as usize];
+    let row_h = scene
+        .levels
+        .first()
+        .map(|l| l.h as f64)
+        .unwrap_or(16.0)
+        .max(1e-9);
+    let sub_rows = scene.subtree_rows(frame) as f64;
+
+    let margin = 14.0f64;
+    let half = ((view.h as f64) * 0.5 - margin).max(1.0);
+    let avail_w = (view.w as f64 - margin * 2.0).max(1.0);
+    let scale = (half / (sub_rows * row_h))
+        .min(avail_w / f.w.max(1e-9))
+        .min(MAX_FOCUS_ROW_PX / row_h)
+        .max(1e-12);
+
+    let dir = if flip_y { -1.0 } else { 1.0 };
+    let centre_x = view.x as f64 + view.w as f64 * 0.5;
+    let centre_y = view.y as f64 + view.h as f64 * 0.5;
+    Viewport {
+        pan_x: centre_x / scale - (f.x + f.w * 0.5),
+        pan_y: centre_y / scale - dir * (f.y as f64 + f.h as f64 * 0.5),
+        scale,
+        flip_y,
+    }
 }
 
 /// Zoom so that a single frame fills the viewport width.
@@ -881,7 +945,7 @@ mod tests {
             [0.0, 0.0],
         );
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
-        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false, false);
         let g = geom(&scene, &vp, view, None);
 
         assert!(g.stats.frames_merged > 0, "the fixture should need merging");
@@ -906,7 +970,7 @@ mod tests {
         // and same-coloured neighbours used to merge into one unbroken bar.
         let scene = synthetic(200, 20);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
-        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false, false);
         let g = geom(&scene, &vp, view, None);
 
         let first_row_y = g.quads.first().map(|q| q.y0).expect("geometry");
@@ -939,7 +1003,7 @@ mod tests {
         // those rows used to blend into a single smeared block.
         let scene = synthetic(200, 20);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
-        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false);
+        let vp = fit(&scene, view, 14.0, Bounds::scene(&scene), false, false);
         let g = geom(&scene, &vp, view, None);
 
         let mut bands: Vec<(f32, f32)> = g.quads.iter().map(|q| (q.y0, q.y1)).collect();
@@ -1021,7 +1085,7 @@ mod tests {
         // A1 has no calls below it, while the graph runs four more rows deep.
         assert_eq!(scene.subtree_max_y(target), 30.0);
 
-        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false, false);
         let g = geom(&scene, &vp, view, Some(focus));
 
         // Everything drawn - the faded path and the bright subtree - has to fill
@@ -1058,7 +1122,7 @@ mod tests {
         let view = ScreenRect::new(17.0, 63.0, 1200.0, 700.0);
         let bounds = Bounds::scene(&scene);
         for flip in [false, true] {
-            let vp = fit(&scene, view, 14.0, bounds, flip);
+            let vp = fit(&scene, view, 14.0, bounds, flip, false);
             let left = vp.sx(scene.min_x);
             // The root row is the one that has to stay on screen, whichever way
             // the rows run.
@@ -1107,7 +1171,7 @@ mod tests {
         let focus = Focus::of(&scene, target);
         assert_eq!(focus.level, 2);
 
-        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false, false);
         let g = geom(&scene, &vp, view, Some(focus));
 
         // The calls below the focused frame are expanded, not hidden. Labels
@@ -1145,7 +1209,7 @@ mod tests {
         let focus = Focus::of(&scene, target);
         assert_eq!(focus.level, 1);
 
-        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false, false);
         let g = geom(&scene, &vp, view, Some(focus));
 
         let expected: Vec<u32> = scene
@@ -1195,7 +1259,7 @@ mod tests {
             .position(|f| f.y == 30.0)
             .expect("row 2 exists") as u32;
         let focus = Focus::of(&scene, target);
-        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false);
+        let vp = fit(&scene, view, 14.0, focus.bounds(&scene), false, false);
 
         let g = geom(&scene, &vp, view, Some(focus));
         // Every bright label must sit on or below the focus row; the faded ones
@@ -1232,7 +1296,7 @@ mod tests {
             .expect("row 1 exists") as u32;
         let focus = Focus::of(&scene, target);
         for bounds in [Bounds::scene(&scene), focus.bounds(&scene)] {
-            let vp = fit(&scene, view, 14.0, bounds, false);
+            let vp = fit(&scene, view, 14.0, bounds, false, false);
             let g = geom(&scene, &vp, view, Some(focus));
             assert!(
                 g.len() <= DEFAULT_BUDGET,
@@ -1244,12 +1308,150 @@ mod tests {
     }
 
     #[test]
+    fn the_orientation_toggle_always_changes_the_picture() {
+        // Written with the root at the top.
+        let top_rooted = synthetic(240, 20);
+        assert!(top_rooted.root_at_top);
+        assert!(
+            flip_for(true, &top_rooted),
+            "asking for the root at the bottom must mirror a top-rooted graph"
+        );
+        assert!(
+            !flip_for(false, &top_rooted),
+            "asking for the root at the top must leave it alone"
+        );
+
+        // Written with the root at the bottom. The old rule made the toggle a
+        // no-op here, which is exactly what "the button does nothing" means.
+        let v = vec![
+            Frame {
+                x: 0.0,
+                w: 500.0,
+                y: 30.0,
+                h: 15.0,
+                color: 0x80_40_20,
+                name: 0,
+            },
+            Frame {
+                x: 0.0,
+                w: 100.0,
+                y: 15.0,
+                h: 15.0,
+                color: 0x80_40_20,
+                name: 0,
+            },
+            Frame {
+                x: 0.0,
+                w: 100.0,
+                y: 0.0,
+                h: 15.0,
+                color: 0x80_40_20,
+                name: 0,
+            },
+        ];
+        let bottom_rooted = Scene::build(
+            v,
+            vec!["fn".into()],
+            "t".into(),
+            "mem".into(),
+            0,
+            0.0,
+            [0.0, 0.0],
+        );
+        assert!(!bottom_rooted.root_at_top);
+        assert!(
+            !flip_for(true, &bottom_rooted),
+            "already rooted at the bottom, nothing to mirror"
+        );
+        assert!(
+            flip_for(false, &bottom_rooted),
+            "asking for the root at the top must mirror it"
+        );
+    }
+
+    #[test]
+    fn an_exact_fit_shows_the_whole_graph() {
+        // 40k frames over 100000 units: the readable fit deliberately zooms in.
+        let scene = synthetic_wide(40_000, 2_000, 100_000.0);
+        let view = ScreenRect::new(1.0, 64.0, 1199.0, 700.0);
+        let bounds = Bounds::scene(&scene);
+
+        let exact = fit(&scene, view, 14.0, bounds, false, true);
+        let (left, right) = (exact.sx(scene.min_x), exact.sx(scene.max_x));
+        let (top, bottom) = (exact.sy(scene.min_y), exact.sy(scene.max_y));
+        assert!(
+            left >= view.x - 0.5 && right <= view.x + view.w + 0.5,
+            "graph x [{left}, {right}] is not inside the view"
+        );
+        assert!(
+            top >= view.y - 0.5 && bottom <= view.y + view.h + 0.5,
+            "graph y [{top}, {bottom}] is not inside the view"
+        );
+
+        // The readable fit still zooms in instead, which is the whole point of
+        // having two of them.
+        let legible = fit(&scene, view, 14.0, bounds, false, false);
+        assert!(
+            legible.scale > exact.scale * 2.0,
+            "the readable fit should zoom in, {} vs {}",
+            legible.scale,
+            exact.scale
+        );
+    }
+
+    #[test]
+    fn focus_view_centres_the_frame_and_splits_the_halves() {
+        let scene = synthetic(240, 20);
+        let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
+        let target = scene
+            .frames
+            .iter()
+            .position(|f| f.y == 30.0)
+            .expect("row 2 exists") as u32;
+        let row = scene.frames[target as usize];
+
+        // Root at the bottom: the subtree grows upwards, the path fades below.
+        let vp = focus_view(&scene, target, view, true);
+
+        let cx = vp.sx(row.x + row.w * 0.5);
+        let cy = vp.sy(row.y + row.h * 0.5);
+        assert!(
+            (cx - (view.x + view.w * 0.5)).abs() < 1.0,
+            "frame is not centred in x: {cx}"
+        );
+        assert!(
+            (cy - (view.y + view.h * 0.5)).abs() < 1.0,
+            "frame is not centred in y: {cy}"
+        );
+
+        // The calls below it sit above the centre, the path above it below it.
+        let deepest = scene.subtree_max_y(target);
+        assert!(
+            vp.sy(deepest) < cy,
+            "the subtree is not above the focused frame"
+        );
+        let parent = scene.frames[0];
+        assert!(
+            vp.sy(parent.y + parent.h) > cy,
+            "the path is not below the focused frame"
+        );
+        assert!(
+            vp.sy(deepest) >= view.y,
+            "the subtree runs off the top of the view"
+        );
+
+        // Drilling in must zoom in, not out.
+        let row_px = row.h as f64 * vp.scale;
+        assert!(row_px > 8.0, "rows are only {row_px:.1}px after focusing");
+    }
+
+    #[test]
     fn flip_y_mirrors_the_rows() {
         let scene = synthetic(1_000, 50);
         let view = ScreenRect::new(0.0, 0.0, 1000.0, 700.0);
         let bounds = Bounds::scene(&scene);
-        let a = fit(&scene, view, 10.0, bounds, false);
-        let b = fit(&scene, view, 10.0, bounds, true);
+        let a = fit(&scene, view, 10.0, bounds, false, false);
+        let b = fit(&scene, view, 10.0, bounds, true, false);
         assert!(a.sy(scene.min_y) < a.sy(scene.max_y));
         assert!(b.sy(scene.min_y) > b.sy(scene.max_y));
 
@@ -1288,7 +1490,7 @@ mod tests {
     fn fully_zoomed_out_still_draws_something() {
         let scene = synthetic(50_000, 500);
         let view = ScreenRect::new(0.0, 0.0, 1200.0, 800.0);
-        let vp = fit(&scene, view, 10.0, Bounds::scene(&scene), false);
+        let vp = fit(&scene, view, 10.0, Bounds::scene(&scene), false, false);
         let g = geom(&scene, &vp, view, None);
         assert!(g.len() > 0);
         assert!(g.stats.frames_considered > 0);

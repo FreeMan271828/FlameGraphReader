@@ -101,9 +101,11 @@ pub struct FlameView {
     /// Clicking a frame drills into its subtree. On by default: it is the
     /// fastest way to answer "what is under this?".
     pub focus_on_click: bool,
-    /// Present the graph with the widest row at the bottom (browser convention).
-    /// Only mirrors documents that are actually rooted at the top.
+    /// Present the graph with the widest row at the bottom (browser convention),
+    /// mirroring whenever that is not how the document is written.
     pub root_at_bottom: bool,
+    /// The next refit ignores the legibility clamp and shows the whole graph.
+    exact_fit: bool,
 
     /// Frames to draw at full strength, plus the faded rows above a focused
     /// subtree and the labels to lay out over them.
@@ -130,6 +132,7 @@ impl Default for FlameView {
             last_view: ScreenRect::new(0.0, 0.0, 1.0, 1.0),
             focus: None,
             focus_path: Vec::new(),
+            exact_fit: false,
             focus_on_click: true,
             root_at_bottom: true,
             geometry: Geometry::default(),
@@ -141,15 +144,23 @@ impl Default for FlameView {
 }
 
 impl FlameView {
+    /// Show the entire graph, even if that makes the rows sub-pixel. Explicit
+    /// "fit"/"whole graph" actions mean exactly that, unlike the automatic fit
+    /// on load which keeps the rows readable.
     pub fn reset_fit(&mut self) {
         self.initialized = false;
+        self.exact_fit = true;
     }
 
-    /// Whether the rows have to be mirrored for the current document and
-    /// orientation preference.
+    /// Whether the rows have to be mirrored to satisfy the orientation
+    /// preference.
+    ///
+    /// This is an absolute comparison, not a one-way "flip it if it is upside
+    /// down": the toggle has to change the picture for every document, including
+    /// ones that already happen to be rooted at the bottom.
     #[inline]
     pub fn flip_y(&self, scene: &Scene) -> bool {
-        self.root_at_bottom && scene.root_at_top
+        lod::flip_for(self.root_at_bottom, scene)
     }
 
     /// The region currently being explored.
@@ -167,6 +178,7 @@ impl FlameView {
         self.focus_path = scene.ancestry(frame);
         self.selected = Some(frame);
         self.initialized = false;
+        self.exact_fit = false;
     }
 
     /// Return to the whole graph.
@@ -336,7 +348,14 @@ impl FlameView {
         // input, so deferring the refit to the next frame would leave a stale
         // view on screen until the mouse moved.
         if !self.initialized {
-            self.vp = lod::fit(scene, view, 14.0, self.bounds(scene), self.flip_y(scene));
+            let exact = std::mem::take(&mut self.exact_fit);
+            let flip = self.flip_y(scene);
+            self.vp = match self.focus {
+                // Drilling in centres the frame and zooms to its subtree, which
+                // is what makes the parent/child relationship readable.
+                Some(f) if !exact => lod::focus_view(scene, f.frame, view, flip),
+                _ => lod::fit(scene, view, 14.0, self.bounds(scene), flip, exact),
+            };
             self.initialized = true;
         }
 
@@ -466,6 +485,7 @@ impl FlameView {
             flip_y: self.vp.flip_y,
         };
         self.initialized = true;
+        self.exact_fit = false;
     }
 }
 
