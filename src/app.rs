@@ -168,10 +168,12 @@ pub struct FlameApp {
     smoke: Option<Smoke>,
     last_frame_at: Option<Instant>,
     frame_ms: f32,
+    last_dt_ms: f32,
 }
 
 impl FlameApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> FlameApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> FlameApp {
+        install_fallback_fonts(&cc.egui_ctx);
         let mut app = FlameApp {
             loader: Loader::new(),
             docs: Vec::new(),
@@ -192,6 +194,7 @@ impl FlameApp {
             smoke: None,
             last_frame_at: None,
             frame_ms: 0.0,
+            last_dt_ms: 0.0,
         };
         for f in files {
             app.open(f, None);
@@ -268,9 +271,13 @@ impl FlameApp {
             match msg {
                 LoadMsg::Finished { path, scene } => {
                     if let Some(doc) = self.docs.iter_mut().find(|d| d.path == path) {
+                        self.status = format!(
+                            "Loaded {} ({} frames)",
+                            path.display(),
+                            fmt_int(scene.len())
+                        );
                         doc.state = DocState::Ready(Arc::from(scene));
                         doc.view = FlameView::default();
-                        self.status = format!("Loaded {} ({} frames)", path.display(), 0);
                     }
                 }
                 LoadMsg::Failed { path, error } => {
@@ -438,6 +445,7 @@ impl FlameApp {
         let now = Instant::now();
         if let Some(prev) = self.last_frame_at {
             let ms = (now - prev).as_secs_f32() * 1000.0;
+            self.last_dt_ms = ms;
             self.frame_ms = if self.frame_ms == 0.0 {
                 ms
             } else {
@@ -557,8 +565,14 @@ impl FlameApp {
     }
 
     fn tick_smoke(&mut self, ctx: &egui::Context) {
+        let dt = self.last_dt_ms;
         let Some(smoke) = &mut self.smoke else { return };
         smoke.tick += 1;
+        // Without this the report never had anything to summarise, so --smoke
+        // never printed and never closed the window.
+        if smoke.warmup == 0 && smoke.remaining > 0 && dt > 0.0 {
+            smoke.times.push(dt);
+        }
         if smoke.remaining == 0 {
             return;
         }
@@ -599,7 +613,9 @@ impl FlameApp {
     // -- UI -----------------------------------------------------------------
 
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        // Wrapped, not clipped: at the minimum window width the right-hand
+        // controls used to slide out of reach.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Open SVG").clicked() {
                 self.pick_files(ctx);
             }
@@ -858,7 +874,10 @@ impl FlameApp {
                     .show(ui, |ui| {
                         for (i, a) in ancestry.iter().enumerate() {
                             let label = format!("{} {}", "  ".repeat(i.min(12)), scene.name_of(*a));
-                            if ui.selectable_label(*a == frame, label).clicked() {
+                            if ui
+                                .add(egui::Button::selectable(*a == frame, label).truncate())
+                                .clicked()
+                            {
                                 let f = scene.frames[*a as usize];
                                 if let Some(d) = self.docs.get_mut(self.active) {
                                     d.view.focus_rect_visible(f.x, f.x + f.w, f.y, f.h);
@@ -880,7 +899,11 @@ impl FlameApp {
                     .show(ui, |ui| {
                         for (c, w) in kids.iter().take(300) {
                             let label = format!("{:.2}%  {}", w / span * 100.0, scene.name_of(*c));
-                            if ui.button(label).clicked() {
+                            if ui
+                                .add(egui::Button::new(label).truncate())
+                                .on_hover_text(scene.name_of(*c))
+                                .clicked()
+                            {
                                 let f = scene.frames[*c as usize];
                                 if let Some(d) = self.docs.get_mut(self.active) {
                                     d.view.focus_rect_visible(f.x, f.x + f.w, f.y, f.h);
@@ -935,7 +958,10 @@ impl FlameApp {
                             scene.frames[fr as usize].w / span * 100.0,
                             scene.name_of(fr)
                         );
-                        if ui.selectable_label(i == cursor, text).clicked() {
+                        if ui
+                            .add(egui::Button::selectable(i == cursor, text).truncate())
+                            .clicked()
+                        {
                             go = Some(i);
                         }
                     }
@@ -1172,7 +1198,8 @@ impl eframe::App for FlameApp {
         if self.show_details {
             egui::Panel::right("fr_details")
                 .resizable(true)
-                .default_size(330.0)
+                .default_size(340.0)
+                .size_range(260.0..=640.0)
                 .show(ui, |ui| self.details(ui, &ctx));
         }
         egui::CentralPanel::default().show(ui, |ui| self.graph(ui, &ctx));
@@ -1248,6 +1275,59 @@ fn report_frame_times(times: &[f32], scene: Option<&Scene>, doc: Option<&Doc>) -
         sorted[sorted.len() - 1]
     ));
     Some(s)
+}
+
+/// Add a system CJK font as a fallback.
+///
+/// egui's bundled fonts have no CJK glyphs, so Chinese / Japanese / Korean
+/// frame names (and the paths in the details panel) showed up as empty boxes.
+/// The font is only consulted for glyphs the bundled ones lack, so Latin text
+/// looks exactly as before. If none of the candidates exist nothing changes.
+fn install_fallback_fonts(ctx: &egui::Context) {
+    // Windows keeps its fonts in the Fonts folder under %WINDIR%, which is not
+    // always on C:.
+    let windir = std::env::var_os("WINDIR").unwrap_or_default();
+    let windows = [
+        "msyh.ttc",
+        "simhei.ttf",
+        "simsun.ttc",
+        "malgun.ttf",
+        "meiryo.ttc",
+    ]
+    .map(|f| std::path::Path::new(&windir).join("Fonts").join(f));
+
+    const CANDIDATES: &[&str] = &[
+        // macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        // Linux
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ];
+    let others = CANDIDATES.iter().map(std::path::PathBuf::from);
+    let Some(bytes) = windows
+        .into_iter()
+        .filter(|_| !windir.is_empty())
+        .chain(others)
+        .find_map(|p| std::fs::read(p).ok())
+    else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "system-cjk".to_owned(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("system-cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]

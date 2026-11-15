@@ -28,11 +28,15 @@ const MIN_PER_ROW: usize = 24;
 const LABEL_MIN_W: f32 = 26.0;
 const LABEL_MIN_H: f32 = 9.0;
 /// Labels laid out per frame, spread over the visible rows.
-pub const LABEL_BUDGET: usize = 400;
+pub const LABEL_BUDGET: usize = 1200;
 
 /// A row narrower than this is unreadable, so fitting is clamped to keep rows
 /// legible even for extremely wide graphs.
 pub const MIN_FIT_ROW_PX: f32 = 3.0;
+
+/// Largest row height the automatic fit will pick when the viewport is tall
+/// enough to afford it.
+pub const PREFERRED_FIT_ROW_PX: f32 = 12.0;
 
 /// Row separation, in screen pixels. Rows thinner than the first constant are
 /// left alone (insetting them would erase them); thicker ones give up at most a
@@ -280,6 +284,12 @@ pub struct LabelReq {
     pub frame: u32,
     pub x: f32,
     pub center_y: f32,
+    /// Width available for the text, from `x` to the right edge of the visible
+    /// part of the frame. The renderer truncates the name to this instead of
+    /// clipping it, which keeps every label in the same clip rect.
+    pub w: f32,
+    /// Visible height of the row the label sits in.
+    pub h: f32,
     /// True for the labels on the faded path above a focused frame: they are
     /// drawn subdued rather than dropped.
     pub faded: bool,
@@ -344,7 +354,13 @@ pub fn fit(
         .map(|l| l.h as f64)
         .unwrap_or(16.0)
         .max(1e-9);
-    let legible = MIN_FIT_ROW_PX as f64 / row_h;
+    // Legibility floor: rows of at least MIN_FIT_ROW_PX, but when the viewport
+    // has room to spare use it. Opening a wide graph as a 3px sliver in the
+    // corner of a mostly empty canvas wasted most of the screen; rows up to
+    // PREFERRED_FIT_ROW_PX that still fit the height make names readable.
+    let fill_height_px = avail_h / h * row_h;
+    let row_px = fill_height_px.clamp(MIN_FIT_ROW_PX as f64, PREFERRED_FIT_ROW_PX as f64);
+    let legible = row_px / row_h;
     if !exact && vp.scale < legible {
         // Re-place rather than zoom about a point: the fitted graph can be only
         // a few pixels tall here, so there is no on-graph point that would leave
@@ -454,6 +470,8 @@ impl Geometry {
 struct RowBudget {
     min_px: f32,
     label_cap: usize,
+    view_x0: f32,
+    view_x1: f32,
 }
 
 /// Build the geometry for one frame of interaction.
@@ -528,8 +546,29 @@ pub fn build(
         );
     }
 
+    // Zoomed in far enough, one frame is millions of pixels wide. Such
+    // coordinates are fine in f64 but lose all precision as f32 vertices, which
+    // shows up as shimmering edges and glitching bars on the GPU. Everything off
+    // screen is invisible anyway, so cut the quads at the viewport.
+    clamp_to_view(&mut out.faded, view);
+    clamp_to_view(&mut out.quads, view);
+
     out.stats.quads = out.len() as u32;
     out.stats.labels = out.labels.len() as u32;
+}
+
+/// Cut quads at the viewport, with a pixel of slack so the cut edge is never
+/// visible. Quads that end up empty are dropped.
+fn clamp_to_view(quads: &mut Vec<Quad>, view: ScreenRect) {
+    let (x0, x1) = (view.x - 1.0, view.x + view.w + 1.0);
+    let (y0, y1) = (view.y - 1.0, view.y + view.h + 1.0);
+    quads.retain_mut(|q| {
+        q.x0 = q.x0.clamp(x0, x1);
+        q.x1 = q.x1.clamp(x0, x1);
+        q.y0 = q.y0.clamp(y0, y1);
+        q.y1 = q.y1.clamp(y0, y1);
+        q.x1 > q.x0 && q.y1 > q.y0
+    });
 }
 
 /// Emit the faded path from the root down to (but excluding) the focused frame.
@@ -578,16 +617,19 @@ fn emit_ancestors(
 
         // The path keeps its names: without them the faded frames cannot be
         // identified and the context is useless.
-        if labels < MAX_ANCESTOR_LABELS && (qx1 - qx0) >= LABEL_MIN_W && (qy1 - qy0) >= LABEL_MIN_H
+        // An ancestor is usually wider than the focused subtree, so its own
+        // left edge can be off screen. Anchor the name at the visible left edge
+        // instead of losing it.
+        let (vx0, vx1) = (qx0.max(view.x), qx1.min(view.x + view.w));
+        if labels < MAX_ANCESTOR_LABELS && (vx1 - vx0) >= LABEL_MIN_W && (qy1 - qy0) >= LABEL_MIN_H
         {
             labels += 1;
             out.labels.push(LabelReq {
                 frame: a,
-                // An ancestor is usually wider than the focused subtree, so its
-                // own left edge can be off screen. Anchor the name at the
-                // visible left edge instead of losing it to the clip.
-                x: qx0.max(view.x) + 2.0,
+                x: vx0 + 2.0,
                 center_y: (qy0 + qy1) * 0.5,
+                w: vx1 - vx0 - 4.0,
+                h: qy1 - qy0,
                 faded: true,
             });
         }
@@ -634,7 +676,7 @@ fn emit_levels(
     let per_row = (limit.saturating_sub(quads.len()) / drawn_rows)
         .saturating_sub(merged_reserve)
         .max(MIN_PER_ROW);
-    let label_cap = (LABEL_BUDGET / drawn_rows).max(4);
+    let label_cap = (LABEL_BUDGET / drawn_rows).max(6);
 
     let mut li = levels.start;
     while li < levels.end {
@@ -667,6 +709,8 @@ fn emit_levels(
                 MIN_RUN_PX
             },
             label_cap,
+            view_x0: view.x,
+            view_x1: view.x + view.w,
         };
 
         emit_row(
@@ -697,12 +741,12 @@ fn emit_row(
     name_colors: Option<&[u32]>,
     limit: usize,
     quads: &mut Vec<Quad>,
-    mut labels: Option<&mut Vec<LabelReq>>,
+    labels: Option<&mut Vec<LabelReq>>,
     stats: &mut Stats,
 ) {
     let frames = &scene.frames;
     let mut run: Option<Run> = None;
-    let mut row_labels = 0usize;
+    let mut row_labels: Vec<LabelReq> = Vec::new();
 
     for idx in range {
         let f = &frames[idx];
@@ -767,13 +811,18 @@ fn emit_row(
             continue;
         }
 
-        if let Some(labels) = labels.as_deref_mut() {
-            if wpx >= LABEL_MIN_W && (sy1 - sy0) >= LABEL_MIN_H && row_labels < rb.label_cap {
-                row_labels += 1;
-                labels.push(LabelReq {
+        if labels.is_some() && (sy1 - sy0) >= LABEL_MIN_H {
+            // Measure the part of the frame that is actually on screen: a wide
+            // frame panned half off the left edge still has a readable stretch,
+            // and its name has to start there, not at the off-screen left edge.
+            let (vx0, vx1) = (sx0.max(rb.view_x0), sx1.min(rb.view_x1));
+            if vx1 - vx0 >= LABEL_MIN_W {
+                row_labels.push(LabelReq {
                     frame: idx as u32,
-                    x: sx0 + 2.0,
+                    x: vx0 + 2.0,
                     center_y: (sy0 + sy1) * 0.5,
+                    w: vx1 - vx0 - 4.0,
+                    h: sy1 - sy0,
                     faded: false,
                 });
             }
@@ -781,6 +830,16 @@ fn emit_row(
     }
 
     flush_run(&mut run, sy0, sy1, limit, quads, stats);
+
+    if let Some(labels) = labels {
+        // Over the row's share: keep the widest frames rather than whichever
+        // happen to be leftmost, they are the ones worth naming.
+        if row_labels.len() > rb.label_cap {
+            row_labels.sort_unstable_by(|a, b| b.w.total_cmp(&a.w));
+            row_labels.truncate(rb.label_cap);
+        }
+        labels.extend(row_labels);
+    }
 }
 
 /// A stretch of frames too narrow to draw individually.
@@ -1465,6 +1524,51 @@ mod tests {
         vp.zoom_at(anchor_x, anchor_y, 3.7);
         assert!((vp.sx(gx) - anchor_x).abs() < 0.01);
         assert!((vp.sy(gy) - anchor_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_label_stays_readable_when_its_frame_hangs_off_the_left_edge() {
+        // One frame 1000 units wide, panned so its left 300px are off screen.
+        // Its name used to be placed at the off-screen left edge and vanished.
+        let scene = synthetic(1, 1);
+        let view = ScreenRect::new(10.0, 0.0, 400.0, 200.0);
+        let vp = Viewport {
+            pan_x: -300.0,
+            pan_y: 0.0,
+            scale: 1.0,
+            flip_y: false,
+        };
+        let g = geom(&scene, &vp, view, None);
+        let l = g.labels.first().expect("the visible part is wide enough");
+        assert!(l.x >= view.x, "label starts off screen at {}", l.x);
+        assert!(
+            l.x + l.w <= view.x + view.w,
+            "label runs past the right edge: {} + {}",
+            l.x,
+            l.w
+        );
+    }
+
+    #[test]
+    fn extreme_zoom_never_emits_coordinates_outside_the_viewport() {
+        // At this scale one frame is hundreds of millions of pixels wide, which
+        // f32 vertices cannot represent without visible jitter.
+        let scene = synthetic(40, 4);
+        let view = ScreenRect::new(0.0, 0.0, 400.0, 200.0);
+        let vp = Viewport {
+            pan_x: -100.0,
+            pan_y: -10.0,
+            scale: 1.0e6,
+            flip_y: false,
+        };
+        let g = geom(&scene, &vp, view, None);
+        assert!(!g.quads.is_empty(), "nothing was drawn");
+        for q in &g.quads {
+            assert!(
+                q.x0 >= -1.0 && q.x1 <= 401.0 && q.y0 >= -1.0 && q.y1 <= 201.0,
+                "quad escaped the viewport: {q:?}"
+            );
+        }
     }
 
     #[test]

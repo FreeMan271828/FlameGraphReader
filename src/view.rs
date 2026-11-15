@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use eframe::egui;
+use egui::text::{LayoutJob, TextWrapping};
 use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke};
 
 use crate::lod::{self, Bounds, Focus, Geometry, ScreenRect, Stats, Viewport};
@@ -192,6 +193,36 @@ impl FlameView {
             _ => lod::fit(scene, view, 14.0, self.bounds(scene), flip, exact),
         };
         self.initialized = true;
+    }
+
+    /// Stop the graph from being dragged, zoomed or arrowed completely out of the
+    /// viewport. Once it was gone there was nothing on screen to orient by, and
+    /// the only way back was to know about the Fit button.
+    pub fn keep_in_view(&mut self, scene: &Scene, view: ScreenRect) {
+        if !self.initialized || view.w <= 0.0 || view.h <= 0.0 {
+            return;
+        }
+        let b = self.bounds(scene);
+        let (x0, x1) = (self.vp.sx(b.x0), self.vp.sx(b.x1));
+        let (ya, yb) = (self.vp.sy(b.y0), self.vp.sy(b.y1));
+        let (y0, y1) = (ya.min(yb), ya.max(yb));
+        let scale = self.vp.scale;
+        // At least this much of the graph has to stay on screen.
+        let keep_x = 64.0f32.min(view.w * 0.25);
+        let keep_y = 48.0f32.min(view.h * 0.25);
+        let (left, right) = (view.x + keep_x, view.x + view.w - keep_x);
+        let (top, bottom) = (view.y + keep_y, view.y + view.h - keep_y);
+
+        if x1 < left {
+            self.vp.pan_x += (left - x1) as f64 / scale;
+        } else if x0 > right {
+            self.vp.pan_x -= (x0 - right) as f64 / scale;
+        }
+        if y1 < top {
+            self.vp.pan_y += (top - y1) as f64 / scale;
+        } else if y0 > bottom {
+            self.vp.pan_y -= (y0 - bottom) as f64 / scale;
+        }
     }
 
     /// Show the entire graph, even if that makes the rows sub-pixel. Explicit
@@ -398,6 +429,7 @@ impl FlameView {
         // input, so deferring the refit to the next frame would leave a stale
         // view on screen until the mouse moved.
         self.apply_pending_fit(scene, view);
+        self.keep_in_view(scene, view);
 
         // ---- geometry ----------------------------------------------------
         self.build_geometry(scene, view);
@@ -438,7 +470,7 @@ impl FlameView {
         if !self.highlight.is_empty() {
             let core = c32(self.palette.hit_rgb());
             for (i, fr) in self.markers(scene) {
-                let r = frame_rect(&self.vp, scene, fr);
+                let r = frame_rect(&self.vp, scene, fr).intersect(rect);
                 if r.max.x < rect.min.x
                     || r.min.x > rect.max.x
                     || r.max.y < rect.min.y
@@ -460,16 +492,36 @@ impl FlameView {
             }
         }
 
+        // The selection stays visible even when clicking does not drill in, or
+        // the selection came from the details panel or a search jump.
+        if let Some(sel) = self.selected {
+            let is_focus = self.focus.map(|f| f.frame) == Some(sel);
+            if !is_focus && lod::is_focused_visible(scene, self.focus, &self.focus_path, sel) {
+                let r = frame_rect(&self.vp, scene, sel);
+                if r.max.x >= rect.min.x
+                    && r.min.x <= rect.max.x
+                    && r.max.y >= rect.min.y
+                    && r.min.y <= rect.max.y
+                {
+                    let r = r.intersect(rect);
+                    outline(&painter, r, Stroke::new(4.0, hit_halo()));
+                    outline(
+                        &painter,
+                        r,
+                        Stroke::new(2.0, Color32::from_rgb(120, 200, 255)),
+                    );
+                }
+            }
+        }
+
         // ---- labels ------------------------------------------------------
         let t_lab = Instant::now();
         if self.show_labels {
             for l in &self.geometry.labels {
-                let clip = frame_rect(&self.vp, scene, l.frame);
-                let h = clip.height();
-                if h < 9.0 {
+                if l.h < 9.0 || l.w < 8.0 {
                     continue;
                 }
-                let size = (h * 0.68).clamp(7.0, 15.0);
+                let size = (l.h * 0.68).clamp(7.0, 15.0);
                 let col = if l.faded {
                     // Names on the faded path must stay readable, so they use a
                     // light colour rather than the contrast colour of a
@@ -478,20 +530,25 @@ impl FlameView {
                 } else {
                     c32(palette::label_color(self.frame_color(scene, l.frame)))
                 };
-                painter.with_clip_rect(clip).text(
-                    pos(l.x, l.center_y),
-                    Align2::LEFT_CENTER,
-                    scene.name_of(l.frame),
+                // Truncated with an ellipsis to the visible width instead of
+                // clipped: no per-label clip rect (each one split the mesh into
+                // its own draw call), and a cut-off name says so.
+                let mut job = LayoutJob::simple_singleline(
+                    scene.name_of(l.frame).to_owned(),
                     FontId::proportional(size),
                     col,
                 );
+                job.wrap = TextWrapping::truncate_at_width(l.w);
+                let galley = painter.layout_job(job);
+                let at = pos(l.x, l.center_y - galley.size().y * 0.5);
+                painter.galley(at, galley, col);
             }
         }
         self.label_us = t_lab.elapsed().as_secs_f64() * 1e6;
 
         // ---- hover outline + tooltip -------------------------------------
         if let Some(h) = self.hovered {
-            let r = frame_rect(&self.vp, scene, h);
+            let r = frame_rect(&self.vp, scene, h).intersect(rect);
             outline(
                 &painter,
                 r,
